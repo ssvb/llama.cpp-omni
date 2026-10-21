@@ -79,8 +79,8 @@ static void moe_log(const char * fmt, ...) {
     va_start(ap, fmt);
     vsnprintf(buf, sizeof(buf), fmt, ap);
     va_end(ap);
-    fprintf(stderr, "[moe-ssd] %s\n", buf);
-    fflush(stderr);
+//    fprintf(stderr, "[moe-ssd] %s\n", buf);
+//    fflush(stderr);
     LLAMA_LOG_INFO("[moe-ssd] %s\n", buf);
 }
 
