@@ -1345,7 +1345,7 @@ struct llama_moe_slot_runtime::impl {
 
     /// 把已打开的 experts fd 的 F_NOCACHE 拨到 `on`。只改缓存行为，不动数据。
     void apply_experts_nocache(bool on) {
-#ifndef _WIN32
+#ifdef __APPLE__
         std::lock_guard<std::mutex> lock(fd_mutex);
         for (const auto & kv : fds) {
             if (fcntl(kv.second, F_NOCACHE, on ? 1 : 0) != 0) {
@@ -1368,8 +1368,10 @@ struct llama_moe_slot_runtime::impl {
         if (found != fds.end()) {
             return found->second;
         }
-#ifdef _WIN32
+#if defined(_WIN32)
         const int fd = _open(path.c_str(), _O_RDONLY | _O_BINARY);
+#elif defined(__linux__)
+        const int fd = open(path.c_str(), O_RDONLY | O_CLOEXEC | (experts_nocache_desired() ? O_DIRECT : 0));
 #else
         const int fd = open(path.c_str(), O_RDONLY | O_CLOEXEC);
         if (experts_nocache_desired() && fcntl(fd, F_NOCACHE, 1) != 0) {
@@ -1414,12 +1416,18 @@ struct llama_moe_slot_runtime::impl {
                 skip = 0;
                 cn++;
             }
-#ifdef _WIN32
+#if defined(_WIN32)
             std::lock_guard<std::mutex> lock(io_mutex);
             if (_lseeki64(fd, (int64_t) (offset + done), SEEK_SET) < 0) {
                 throw std::runtime_error("failed to seek MoE experts");
             }
             const ssize_t result = _read(fd, cur[0].iov_base, (unsigned int) cur[0].iov_len);
+#elif defined(__linux__)
+            const ssize_t result = preadv(fd, cur, cn, (off_t) (offset + done));
+            if (result < 0 && errno == EINVAL && experts_nocache_desired()) {
+                throw std::runtime_error(format(
+                    "failed to read MoE experts at offset %zu (bad alignment for LLAMA_MOE_F_NOCACHE)", offset + done));
+            }
 #else
             const ssize_t result = preadv(fd, cur, cn, (off_t) (offset + done));
 #endif
