@@ -916,6 +916,11 @@ static buft_list_t make_cpu_buft_list(const std::vector<llama_device> & devices,
 //
 // 后端若不提供，返回 nullptr，调用方回退到默认行为。
 static ggml_backend_buffer_type_t make_alloc_only_buft(ggml_backend_dev_t dev) {
+    // The legacy CPU buffer type has no device pointer and the CPU backend does
+    // not expose the alloc-only proc-address hook. Use a distinct host buffer.
+    if (dev && ggml_backend_dev_type(dev) == GGML_BACKEND_DEVICE_TYPE_CPU) {
+        return ggml_backend_cpu_buffer_type_alloc_only();
+    }
     ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(dev);
     if (!reg) {
         return nullptr;
@@ -1306,6 +1311,10 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
     ggml_backend_dev_t cpu_dev = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_CPU);
     if (cpu_dev == nullptr) {
         throw std::runtime_error(format("%s: no CPU backend found", __func__));
+    }
+    // Register the CPU path even when the CPU device was not visited above.
+    if (ggml_backend_buffer_type_t buft = make_alloc_only_buft(cpu_dev)) {
+        pimpl->alloc_only_buft[cpu_dev] = buft;
     }
 
     // calculate the split points
@@ -1708,7 +1717,7 @@ ggml_tensor * llama_model_base::create_tensor_own_alloc(llama_model_loader & ml,
     // 所以这个改动对现有路径是透明的。
     ggml_backend_dev_t dev = tn.bid == -1
         ? nullptr
-        : ggml_backend_buft_get_device(pimpl->dev_layer.at(tn.bid).buft_list->front().second);
+        : pimpl->dev_layer.at(tn.bid).dev;
 
     // 诊断开关：退回「和非专家权重共用一个 buffer」的旧行为，用于 A/B。
     static const bool disabled = [] {
@@ -1738,7 +1747,7 @@ ggml_tensor * llama_model_base::create_expert_tensor_from_manifest(llama_model_l
     // 的文件映射包住（见 create_tensor_own_alloc 的说明）。
     ggml_backend_dev_t dev = tn.bid == -1
         ? nullptr
-        : ggml_backend_buft_get_device(pimpl->dev_layer.at(tn.bid).buft_list->front().second);
+        : pimpl->dev_layer.at(tn.bid).dev;
 
     const auto it = dev ? pimpl->alloc_only_buft.find(dev) : pimpl->alloc_only_buft.end();
     if (it == pimpl->alloc_only_buft.end()) {

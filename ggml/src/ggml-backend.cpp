@@ -2355,6 +2355,31 @@ ggml_backend_buffer_type_t ggml_backend_cpu_buffer_type(void) {
     return &ggml_backend_cpu_buffer_type;
 }
 
+// Distinct host buffer for tensors whose contents are populated by runtime I/O.
+static const char * ggml_backend_cpu_alloc_only_buffer_type_get_name(ggml_backend_buffer_type_t buft) {
+    GGML_UNUSED(buft);
+    return "CPU_ALLOC_ONLY";
+}
+
+ggml_backend_buffer_type_t ggml_backend_cpu_buffer_type_alloc_only(void) {
+    static struct ggml_backend_buffer_type ggml_backend_cpu_alloc_only_buffer_type = {
+        /* .iface   = */ {
+            /* .get_name         = */ ggml_backend_cpu_alloc_only_buffer_type_get_name,
+            /* .alloc_buffer     = */ ggml_backend_cpu_buffer_type_alloc_buffer,
+            /* .get_alignment    = */ ggml_backend_cpu_buffer_type_get_alignment,
+            /* .get_max_size     = */ NULL, // defaults to SIZE_MAX
+            /* .get_alloc_size   = */ NULL, // defaults to ggml_nbytes
+            /* .is_host          = */ ggml_backend_cpu_buffer_type_is_host,
+            /* .is_host_addressable = */ NULL, // fall back to is_host
+        },
+        // Keep this NULL: the CPU buffer type has no device pointer. Looking up
+        // the device lookup here creates a cross-archive symbol dependency.
+        /* .device  = */ NULL,
+        /* .context = */ NULL,
+    };
+    return &ggml_backend_cpu_alloc_only_buffer_type;
+}
+
 static const char * ggml_backend_cpu_buffer_from_ptr_type_get_name(ggml_backend_buffer_type_t buft) {
     return "CPU_Mapped";
 

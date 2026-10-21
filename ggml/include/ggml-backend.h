@@ -430,6 +430,8 @@ extern "C" {
     // CPU buffer types are always available
     GGML_API ggml_backend_buffer_t      ggml_backend_cpu_buffer_from_ptr(void * ptr, size_t size);
     GGML_API ggml_backend_buffer_type_t ggml_backend_cpu_buffer_type(void);
+    // Buffer type for writable tensors populated by runtime I/O, not model mmap.
+    GGML_API ggml_backend_buffer_type_t ggml_backend_cpu_buffer_type_alloc_only(void);
 
 #ifdef  __cplusplus
 }
