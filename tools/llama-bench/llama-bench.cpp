@@ -357,6 +357,8 @@ struct cmd_params {
     bool                             no_warmup;
     output_formats                   output_format;
     output_formats                   output_format_stderr;
+    std::string                      moe_experts;
+    int32_t                          moe_slot_bank;
 };
 
 static const cmd_params cmd_params_defaults = {
@@ -401,6 +403,8 @@ static const cmd_params cmd_params_defaults = {
     /* no_warmup            */ false,
     /* output_format        */ MARKDOWN,
     /* output_format_stderr */ NONE,
+    /* moe_experts          */ "",
+    /* moe_slot_bank        */ 0,
 };
 
 static void print_usage(int /* argc */, char ** argv) {
@@ -461,6 +465,8 @@ static void print_usage(int /* argc */, char ** argv) {
     printf("                                              (default: disabled)\n");
     printf("  -nopo, --no-op-offload <0|1>                (default: 0)\n");
     printf("  --no-host <0|1>                             (default: %s)\n", join(cmd_params_defaults.no_host, ",").c_str());
+    printf("  --moe-experts <PATH>                        routed expert weights directory or manifest\n");
+    printf("  --moe-slot-bank <N>                         resident routed expert slots (requires --moe-experts)\n");
     printf("\n");
     printf(
         "Multiple values can be given for each parameter by separating them with ','\n"
@@ -513,6 +519,8 @@ static cmd_params parse_cmd_params(int argc, char ** argv) {
     params.delay                = cmd_params_defaults.delay;
     params.progress             = cmd_params_defaults.progress;
     params.no_warmup            = cmd_params_defaults.no_warmup;
+    params.moe_experts          = cmd_params_defaults.moe_experts;
+    params.moe_slot_bank        = cmd_params_defaults.moe_slot_bank;
 
     if (const char * env = getenv("HF_TOKEN")) {
         params.hf_token = env;
@@ -809,6 +817,24 @@ static cmd_params parse_cmd_params(int argc, char ** argv) {
                 }
                 auto p = string_split<bool>(argv[i], split_delim);
                 params.use_direct_io.insert(params.use_direct_io.end(), p.begin(), p.end());
+            } else if (arg == "--moe-experts") {
+                if (++i >= argc) {
+                    invalid_param = true;
+                    break;
+                }
+                params.moe_experts = argv[i];
+                if (params.moe_experts.empty()) {
+                    throw std::invalid_argument("--moe-experts path cannot be empty");
+                }
+            } else if (arg == "--moe-slot-bank") {
+                if (++i >= argc) {
+                    invalid_param = true;
+                    break;
+                }
+                params.moe_slot_bank = std::stoi(argv[i]);
+                if (params.moe_slot_bank <= 0) {
+                    throw std::invalid_argument("--moe-slot-bank must be positive");
+                }
             } else if (arg == "-embd" || arg == "--embeddings") {
                 if (++i >= argc) {
                     invalid_param = true;
@@ -1005,6 +1031,11 @@ static cmd_params parse_cmd_params(int argc, char ** argv) {
         exit(1);
     }
 
+    if (params.moe_experts.empty() != (params.moe_slot_bank == 0)) {
+        fprintf(stderr, "error: --moe-experts and --moe-slot-bank must be specified together\n");
+        exit(1);
+    }
+
     if (!params.hf_repo.empty()) {
         for (size_t i = 0; i < params.hf_repo.size(); i++) {
             common_params_model model;
@@ -1149,6 +1180,8 @@ struct cmd_params_instance {
     bool               no_host;
     size_t             fit_target;
     uint32_t           fit_min_ctx;
+    std::string        moe_experts;
+    int32_t            moe_slot_bank;
 
     llama_model_params to_llama_mparams() const {
         llama_model_params mparams = llama_model_default_params();
@@ -1163,6 +1196,8 @@ struct cmd_params_instance {
         mparams.use_mmap      = use_mmap;
         mparams.use_direct_io = use_direct_io;
         mparams.no_host       = no_host;
+        mparams.moe_experts_path = moe_experts.empty() ? nullptr : moe_experts.c_str();
+        mparams.moe_slot_bank    = moe_slot_bank;
 
         if (n_cpu_moe <= 0) {
             if (tensor_buft_overrides.empty()) {
@@ -1205,6 +1240,7 @@ struct cmd_params_instance {
 
     bool equal_mparams(const cmd_params_instance & other) const {
         return model == other.model && n_gpu_layers == other.n_gpu_layers && n_cpu_moe == other.n_cpu_moe &&
+               moe_experts == other.moe_experts && moe_slot_bank == other.moe_slot_bank &&
                split_mode == other.split_mode &&
                main_gpu == other.main_gpu && tensor_split == other.tensor_split &&
                use_mmap == other.use_mmap && use_direct_io == other.use_direct_io &&
@@ -1295,6 +1331,8 @@ static std::vector<cmd_params_instance> get_cmd_params_instances(const cmd_param
                 /* .no_host      = */ noh,
                 /* .fit_target   = */ fpt,
                 /* .fit_min_ctx  = */ fpc,
+                /* .moe_experts  = */ params.moe_experts,
+                /* .moe_slot_bank = */ params.moe_slot_bank,
             };
             instances.push_back(instance);
         }
@@ -1332,6 +1370,8 @@ static std::vector<cmd_params_instance> get_cmd_params_instances(const cmd_param
                 /* .no_host      = */ noh,
                 /* .fit_target   = */ fpt,
                 /* .fit_min_ctx  = */ fpc,
+                /* .moe_experts  = */ params.moe_experts,
+                /* .moe_slot_bank = */ params.moe_slot_bank,
             };
             instances.push_back(instance);
         }
@@ -1369,6 +1409,8 @@ static std::vector<cmd_params_instance> get_cmd_params_instances(const cmd_param
                 /* .no_host      = */ noh,
                 /* .fit_target   = */ fpt,
                 /* .fit_min_ctx  = */ fpc,
+                /* .moe_experts  = */ params.moe_experts,
+                /* .moe_slot_bank = */ params.moe_slot_bank,
             };
             instances.push_back(instance);
         }
