@@ -53,10 +53,10 @@ static int moe_ssd_io_threads() {
     return n;
 }
 
-// slot_to_expert 的哨兵值。
-//   kSlotFree    -1：空位，可分配
-//   kSlotPending -2：已被预读 worker **认领**、内容尚未写完。主路径必须跳过它
-//                    （既不能覆盖，也不能当成有效缓存条目）。
+// Sentinel values for slot_to_expert.
+//   kSlotFree    -1: empty slot, available for allocation
+//   kSlotPending -2: claimed by a prefetch worker; contents are not written yet. The main path must skip it
+//                    (neither overwrite it nor treat it as a valid cache entry).
 constexpr int32_t kSlotFree    = -1;
 constexpr int32_t kSlotPending = -2;
 
@@ -72,7 +72,7 @@ static int64_t now_ns() {
         std::chrono::steady_clock::now().time_since_epoch()).count();
 }
 
-// Xcode 能抓住 stderr（和 [MBMtmd] 一样）。llama-cli 的 callback 会吞掉纯 LLAMA_LOG_INFO。
+// Xcode can capture stderr (as with [MBMtmd]). llama-cli callbacks swallow plain LLAMA_LOG_INFO.
 static void moe_log(const char * fmt, ...) {
     char buf[768];
     va_list ap;
@@ -127,8 +127,8 @@ struct lookahead_expert_prefetch {
 
     bool enabled = false;
     int32_t depth = 8;
-    /// 真正**读盘**的专家数；0 = 只算预测、不读盘（把预测用来指导淘汰）。
-    /// 由 LLAMA_MOE_PREFETCH_READ 控制，默认 = depth（旧行为）。
+    /// Number of experts actually read from disk; 0 = predict only, without disk reads (use predictions to guide eviction).
+    /// Controlled by LLAMA_MOE_PREFETCH_READ; defaults to depth (legacy behavior).
     int32_t read_n = 0;
     int32_t n_slots = 0;
     int32_t n_expert = 0;
@@ -154,25 +154,25 @@ struct lookahead_expert_prefetch {
     int32_t arm_expert[kMaxDepth] = {};
 
     std::function<void(int, int, int)> read_fn;
-    // 窗口模式下 slot 由窗口 LRU 决定，不由乒乓区算出来 —— 此时传给 read_fn 的
-    // slot 用 -1 作哨兵（表示「你按窗口自己挑」）。见 impl 的那个 lambda。
+    // In window mode, slots are chosen by the window LRU, not by the ping-pong region; pass to read_fn
+    // slot = -1 as a sentinel (meaning "choose one yourself from the window"). See the lambda in impl.
     bool window_mode = false;
     std::atomic<uint64_t> n_hits{0};
     std::atomic<uint64_t> n_armed{0};
-    // 诊断：预读到底有没有在工作。见 arm()/take()。
-    std::atomic<uint64_t> n_arm_skipped{0};   // 因上一个 job 未完成而放弃的次数
-    std::atomic<uint64_t> n_waits{0};         // take() 里真的阻塞等待的次数
-    std::atomic<int64_t>  n_wait_ns{0};       // 阻塞等待的总时长
-    std::atomic<uint64_t> n_pred_read{0};     // worker 实际读进去的专家数
-    std::atomic<uint64_t> n_pred_published{0};// 预读发布进窗口（真正变成缓存条目）的次数
-    std::atomic<uint64_t> n_predict_only{0};  // 只预测不读盘的次数（轻量组合模式）
-    std::atomic<uint64_t> n_evict_saved{0};   // 因「预测会用」而被跳过的淘汰次数
-    std::atomic<uint64_t> n_evict_forced{0};  // pass0 找不到非预测候选、被迫进入 pass1 的次数
-    std::atomic<uint64_t> n_pred_cached{0};   // arm 时因「目标层已有」而被过滤掉的预测数
-    std::atomic<uint64_t> n_used_from_pf{0};  // 主路径用到的专家里，落在**预读区**的次数
-                                              // （用完不保留，本层结束就被重填冲掉）
-    std::atomic<uint64_t> n_evict_total{0};   // 淘汰总次数
-    std::atomic<uint64_t> n_pred_bytes{0};    // worker 实际读进去的字节
+    // Diagnostics: is prefetch actually working? See arm()/take().
+    std::atomic<uint64_t> n_arm_skipped{0};   // Number of jobs skipped because the previous job had not finished
+    std::atomic<uint64_t> n_waits{0};         // Number of actual blocking waits in take()
+    std::atomic<int64_t>  n_wait_ns{0};       // Total time spent blocked
+    std::atomic<uint64_t> n_pred_read{0};     // Number of experts actually read by the worker
+    std::atomic<uint64_t> n_pred_published{0};// Number of prefetch results published into the window (became cache entries)
+    std::atomic<uint64_t> n_predict_only{0};  // Number of prediction-only operations with no disk reads (lightweight combined mode)
+    std::atomic<uint64_t> n_evict_saved{0};   // Evictions skipped because an expert was predicted to be used
+    std::atomic<uint64_t> n_evict_forced{0};  // Number of times pass 0 found no non-predicted candidate and had to enter pass 1
+    std::atomic<uint64_t> n_pred_cached{0};   // Predictions filtered out by arm because they were already in the target layer
+    std::atomic<uint64_t> n_used_from_pf{0};  // Number of main-path experts that came from the **prefetch region**
+                                              // (not retained after use; overwritten when this layer finishes)
+    std::atomic<uint64_t> n_evict_total{0};   // Total number of evictions
+    std::atomic<uint64_t> n_pred_bytes{0};    // Number of bytes actually read by the worker
     bool ready = false;
 
     void init(int32_t slots, int32_t experts, int32_t last_moe, std::function<void(int, int, int)> fn) {
@@ -203,11 +203,11 @@ struct lookahead_expert_prefetch {
         }
         {
             const char * rs = std::getenv("LLAMA_MOE_PREFETCH_READ");
-            read_n = rs ? std::atoi(rs) : -1;   // -1 = 跟随 depth
+            read_n = rs ? std::atoi(rs) : -1;   // -1 = follow depth
         }
         set_depth(want);
         if (read_n < 0 || read_n > depth) {
-            read_n = depth;                     // 默认与 depth 一致（旧行为）
+            read_n = depth;                     // Default to depth (legacy behavior)
         }
     }
 
@@ -306,34 +306,34 @@ struct lookahead_expert_prefetch {
         std::unique_lock<std::mutex> lk(mtx);
 
         if (window_mode) {
-            // 窗口模式：worker 与缓存**共用同一片 slot**，但**不需要等它**。
+            // In window mode, the worker and cache **share the same slots**, but **do not need to wait for each other**.
             //
-            // 为什么可以不等（这是「缓存 + 预读结合」的关键）：
-            //   1. worker 认领 slot 时标 `kSlotPending`，主路径分配/淘汰都跳过它 ——
-            //      既不会覆盖 worker 正在写的位置，也不会把半成品当成有效条目；
-            //   2. 主路径要的专家如果 worker 已经**发布**完成，`expert_to_slot` 里就有，
-            //      自然算命中；没发布就按未命中自己读（最多重复读一次，代价有界）；
-            //   3. worker 读盘时**不持锁**（见 install_prefetch_into_window），
-            //      所以不会把主线程挡在 mutex 上。
+            // Why this works (the key to combining cache + prefetch):
+            //   1. When the worker claims a slot, it marks it `kSlotPending`; the main path skips it during allocation/eviction —
+            //      so it neither overwrites a slot being written nor treats incomplete data as a valid entry;
+            //   2. If the worker has already **published** an expert needed by the main path, `expert_to_slot` contains it,
+            //      so it is a hit; otherwise the main path handles it as a miss and reads it itself (at most one duplicate read);
+            //   3. The worker does **not hold a lock** while reading from disk (see install_prefetch_into_window),
+            //      so it does not block the main thread on the mutex.
             //
-            // 以前这里无条件等整批 K 个读完，实测每 token 白等 43ms ——
-            // 那才是「缓存与预读互斥」的真正原因，不是两者本质冲突。
+            // Previously, this waited unconditionally for all K reads to finish, wasting 43 ms per token in measurements —
+            // that was the real reason cache and prefetch interfered, not an inherent conflict between them.
             arm_layer = -1;
             arm_n = 0;
             return;
         }
 
-        // 乒乓模式：worker 写尾部专用区 [slot_floor, n_slots)，主路径只用
-        // [0, slot_floor)（见 process() 里 alloc_hi = slot_floor），两者**不重叠**，
-        // 所以不需要等 worker。
+        // Ping-pong mode: the worker writes to its dedicated tail region [slot_floor, n_slots), while the main path uses only
+        // [0, slot_floor) (see alloc_hi = slot_floor in process()); the regions **do not overlap**,
+        // so the main path need not wait for the worker.
         //
-        // 以前这里无条件 cv_done.wait()，等的是**整批 K 个专家**（含主路径根本
-        // 不需要的那些）。实测代价很大：K=8 时每 token 白等 54.6ms、K=16 时 259ms
-        // —— 比整步还长，直接把预读的收益吃光。
-        // 现在改成：**只接受已经完成、且正是本层**的预读结果；没好的就跳过，
-        // 主路径按未命中正常读（本来也要读）。
+        // Previously, cv_done.wait() waited unconditionally for the **entire batch of K experts**, including experts the main path
+        // did not need at all. The measured cost was high: 54.6 ms wasted per token at K=8 and 259 ms at K=16,
+        // longer than a whole step, wiping out the benefit of prefetch.
+        // Now, **accept only completed prefetch results for the current layer**; skip unfinished results,
+        // and let the main path read misses normally (it would need to read them anyway).
         if (job_running) {
-            // 结果还没好。arm_layer 仍是上一次的值，下面的一致性检查会拦住它。
+            // The result is not ready yet. arm_layer still holds the previous value, so the consistency check below will reject it.
             return;
         }
         if (arm_layer != layer || arm_n <= 0) {
@@ -354,8 +354,8 @@ struct lookahead_expert_prefetch {
             return;
         }
 
-        // read_n == 0：只要预测、不读盘。这是「缓存 + 预测」的轻量组合形态。
-        // 预测本身由调用方（impl::process）存下来供淘汰参考。
+        // read_n == 0: predict only, without disk reads. This is a lightweight combination of caching and prediction.
+        // The caller (impl::process) stores the predictions for use by eviction.
         if (read_n <= 0) {
             n_predict_only.fetch_add(1, std::memory_order_relaxed);
             return;
@@ -363,8 +363,8 @@ struct lookahead_expert_prefetch {
 
         std::lock_guard<std::mutex> lk(mtx);
         if (job_pending || job_running) {
-            // 上一次预读还没跑完 -> 这次直接放弃。读比算慢时这里会大量命中，
-            // 预读的收益就基本归零了。量出来才知道它是不是瓶颈。
+            // The previous prefetch is still running, so skip this one. This happens often when reads are slower than compute,
+            // and prefetch then provides almost no benefit. Measuring this reveals whether it is a bottleneck.
             n_arm_skipped.fetch_add(1, std::memory_order_relaxed);
             return;
         }
@@ -373,7 +373,7 @@ struct lookahead_expert_prefetch {
         job_n = 0;
         std::vector<uint8_t> seen((size_t) n_expert, 0);
         for (int32_t e : pred) {
-            if (job_n >= read_n) {   // 只读 read_n 个（<= depth）；read_n==0 已在上面返回
+            if (job_n >= read_n) {   // Read only read_n experts (<= depth); read_n == 0 returned above
                 break;
             }
             if (e < 0 || e >= n_expert || seen[(size_t) e]) {
@@ -425,9 +425,9 @@ struct lookahead_expert_prefetch {
                         continue;
                     }
                     try {
-                        // 窗口模式传 -1：让 impl 按目标层的窗口 LRU 挑 slot。
-                        // 预读写进**目标层自己的窗口**，而不是尾部乒乓区 ——
-                        // 这样预读成果直接变成那层的缓存命中，不需要再搬一次。
+                        // In window mode, pass -1 so impl can choose a slot using the target layer window LRU.
+                        // Prefetch writes into the **target layer's own window**, not the tail ping-pong region —
+                        // so the result is immediately a cache hit for that layer, with no extra copy.
                         read_fn(layer, ex[k], window_mode ? -1 : (base + k));
                         n_pred_read.fetch_add(1, std::memory_order_relaxed);
                         n_pred_published.fetch_add(1, std::memory_order_relaxed);
@@ -467,8 +467,8 @@ struct llama_moe_slot_runtime::impl {
         const llama_moe_experts_entry * entry = nullptr;
     };
 
-    // 一次读取要用的「打包视图」：prefill 和 decode 各有自己的一套张量与文件布局。
-    // 抽出来是为了让 read_expert_directv 能按阶段选，不用复制读取逻辑。
+    // A "packed view" used for a read: prefill and decode each have their own tensors and file layout.
+    // Factor it out so read_expert_directv can select by phase without duplicating the read logic.
     struct pack_view {
         const std::vector<binding> * bindings = nullptr;
         const std::vector<size_t>  * order    = nullptr;
@@ -483,10 +483,10 @@ struct llama_moe_slot_runtime::impl {
     struct layer_state {
         bool enabled = false;
         bool pack_ok = false;
-        int32_t window_start = 0;   // 本层 decode 窗口的起始 slot（0 表示未启用窗口）
-        /// 本层窗口的**总宽度**（缓存区 c_il + 预读暂存区 K）。各层可不同 ——
-        /// 见 llama_model::moe_layer_windows()：热层给大、冷层给小。
-        /// window_start 恒为 0（每层有自己的 decode 张量，slot 空间就是 [0, width)）。
+        int32_t window_start = 0;   // Starting slot of this layer's decode window (0 means the window is disabled)
+        /// Total width of this layer's window (**cache region c_il + prefetch staging region K**). May vary by layer —
+        /// see llama_model::moe_layer_windows(): larger for hot layers, smaller for cold ones.
+        /// window_start is always 0 (each layer has its own decode tensor, so its slot space is [0, width)).
         int32_t window_width = 0;
         size_t pack_base = 0;
         size_t pack_bytes = 0;
@@ -495,7 +495,7 @@ struct llama_moe_slot_runtime::impl {
         std::vector<binding> bindings;
         std::vector<size_t> pack_order; // bindings sorted by file offset, i.e. experts packed order
 
-        // decode 专用的一套（每层独立窗口，ne[2] = c）。prefill 用上面那套。
+        // Decode-specific set (independent window per layer, ne[2] = c). Prefill uses the set above.
         bool dec_pack_ok = false;
         size_t dec_pack_base = 0;
         size_t dec_pack_stride = 0;
@@ -503,8 +503,8 @@ struct llama_moe_slot_runtime::impl {
         std::vector<binding> dec_bindings;
         std::vector<size_t> dec_pack_order;
 
-        /// 预读成功发布进本窗口的次数（诊断用；与 n_hits 的区别是后者统计的是
-        /// 主路径命中，这里统计 worker 的产出）。
+        /// Number of successful prefetch results published into this window (diagnostic; n_hits counts main-path hits,
+        /// whereas this counter measures worker output).
         uint64_t n_prefetch_published = 0;
         std::vector<int32_t> slot_to_expert;
         std::vector<int32_t> expert_to_slot;
@@ -532,14 +532,14 @@ struct llama_moe_slot_runtime::impl {
         size_t bytes = 0;
     };
 
-    // 「合并相邻专家读」可行性统计。见 accumulate_runs() 的注释。
+    // Feasibility statistics for merging reads of adjacent experts. See the comment in accumulate_runs().
     struct run_stats {
-        int n          = 0;   // 连续段总数（仅按 expert id 连续划分）
-        int experts    = 0;   // 落在段里的专家数（应等于 miss 总数）
-        int max        = 0;   // 最长段
-        int ok_n       = 0;   // 段内 slot 也连号的段数（可零拷贝合并）
-        int ok_ex      = 0;   // 这些段覆盖的专家数
-        int scatter_n  = 0;   // slot 不连号、需 scratch 中转的段数
+        int n          = 0;   // Total number of contiguous runs (grouped by consecutive expert IDs only)
+        int experts    = 0;   // Number of experts in runs (should equal the total number of misses)
+        int max        = 0;   // Longest run
+        int ok_n       = 0;   // Runs whose slots are also consecutive (can be merged with zero copies)
+        int ok_ex      = 0;   // Number of experts covered by those runs
+        int scatter_n  = 0;   // Runs with non-consecutive slots that require a scratch buffer
         int scatter_ex = 0;
     };
 
@@ -563,40 +563,40 @@ struct llama_moe_slot_runtime::impl {
         std::atomic<int64_t>  pread_ns{0};
     };
 
-    /// 每层「下一步预测会用到的专家」列表，由上一层 arm() 写入、本层 process() 消费。
-    /// 用途是**零 I/O 成本**地改进淘汰：预测会用的条目不该被换出去。
+    /// Per-layer list of experts predicted to be used in the next step, written by the previous layer's arm() and consumed by this layer's process().
+    /// Used to improve eviction at **zero I/O cost**: entries predicted to be used should not be evicted.
     std::vector<std::vector<int32_t>> predicted;
     std::mutex pred_mtx;
 
-    // 整个进程的完整 I/O 计量（主路径 + 预读），见 readv_span。
+    // Complete process-wide I/O accounting (main path + prefetch); see readv_span.
     std::atomic<uint64_t> io_bytes_all{0};
     std::atomic<uint64_t> io_calls_all{0};
     uint64_t last_io_bytes = 0;
     uint64_t last_io_calls = 0;
-    // 「图执行期间的专家管理耗时」累计，见 add_process_ns。
+    // Cumulative time spent managing experts during graph execution; see add_process_ns.
     std::atomic<int64_t> process_ns{0};
-    // 诊断：把 process() 内部再拆三层，用来定位「记账 3.5 → 19.5 ms」那笔异常。
-    // 三者的和是 process_ns 的子集，差值就是其余部分（分配、淘汰、统计等）。
+    // Diagnostics: split process() into three internal sections to locate the unexplained increase from 3.5 to 19.5 ms.
+    // Their sum is a subset of process_ns; the difference is the remaining work (allocation, eviction, statistics, etc.).
     std::atomic<int64_t> readids_ns{0};
     std::atomic<int64_t> install_ns{0};
     std::atomic<int64_t> writeids_ns{0};
-    // 诊断：各层「用到的专家并集」大小之和（= 图里真正要做的 (行,专家) matvec 次数）。
-    // 用来区分 ε 是「按并集大小（kernel 次数）」还是「按字节」增长。
+    // Diagnostics: sum of the sizes of the per-layer unions of experts used (= actual (row, expert) matvec count in the graph).
+    // Used to tell whether ε grows with union size (kernel count) or with bytes.
     std::atomic<int64_t> unique_sum{0};
-    // 诊断：逐层 miss 累计（只统计 decode 步）。用来判断「每层均匀 1.x 个」还是
-    // 「少数层很多」—— 前者意味着 40 次串行等待，后者只需解决几层。
+    // Diagnostics: per-layer cumulative misses (decode steps only). Distinguishes "about 1.x per layer" from
+    // "many misses in only a few layers" — the former means 40 serial waits; the latter requires addressing only a few layers.
     std::vector<uint64_t> miss_per_layer;
-    /// miss 在 selected_experts（按分数降序）里的**位置**直方图。
-    /// 用来判断能否用「固定尾部预留」代替排序：
-    /// 若 miss 集中在末尾几位，就把末尾几位划成第二组，求和顺序不变（可保逐字节一致）。
-    /// A2：每层 MoE 的 n_expert_used 里，**末尾**这么多位置允许延后读取。
+    /// Histogram of the **positions** of misses in selected_experts (sorted by descending score).
+    /// Used to determine whether sorting can be replaced by reserving a fixed tail segment:
+    /// if misses cluster near the end, split off the last few positions as a second group while preserving summation order (and byte-for-byte output).
+    /// A2: number of **trailing positions** among each MoE layer's n_expert_used that may have their reads deferred.
     ///
-    /// 动机：miss 高度集中在分数顺序的末尾（实测 0:0.03 ... 7:0.22）。把这些位置
-    /// 的缺失专家延后到「前面那些已驻留专家算完之后」再读，读就与 GPU 计算重叠了。
-    /// 固定按位置切（而不是按是否驻留排序切）能保持求和顺序不变 → 输出逐字节一致。
+    /// Motivation: misses are concentrated near the end of score order (measured values: 0:0.03 ... 7:0.22). Defer misses at those positions
+    /// until the earlier resident experts have finished computing, so the reads overlap GPU compute.
+    /// Splitting at fixed positions (rather than sorting by residency) preserves summation order, keeping output byte-for-byte identical.
     int32_t matmul_split = 0;
 
-    /// 每层被延后读取的 (expert, slot)，由 phase A 写入、phase B 消费。
+    /// Per-layer list of deferred (expert, slot) pairs, written by phase A and consumed by phase B.
     std::vector<std::vector<pending_install>> deferred;
 
     uint64_t miss_pos[16] = {};
@@ -604,7 +604,7 @@ struct llama_moe_slot_runtime::impl {
     uint64_t miss_per_layer_steps = 0;
     int64_t last_process_ns = 0;
     uint64_t last_flush_idx = 0;
-    // 预读诊断字段的增量基线，见 flush_ubatch。
+    // Baseline for deltas of prefetch diagnostic fields; see flush_ubatch.
     uint64_t last_arm_skipped = 0;
     uint64_t last_wait_count = 0;
     int64_t  last_wait_ns = 0;
@@ -643,9 +643,9 @@ struct llama_moe_slot_runtime::impl {
             state.slot_to_expert.assign(n_slots, kSlotFree);
             state.expert_to_slot.assign(n_expert, kSlotFree);
             state.slot_age.assign(n_slots, 0);
-            // window_start 不在这里算 —— decode_window 要到 resolve_decode_window()
-            // 才确定，此处还是 0。在那边统一赋值，否则所有层会共用窗口起点 [0, W)，
-            // 层间互相覆盖（曾经的实际 bug）。
+            // window_start is not computed here — decode_window is not known until resolve_decode_window(),
+            // so it is still 0 at this point. Assign it there in one place; otherwise all layers share [0, W),
+            // causing them to overwrite one another (a real bug encountered previously).
             userdata[il] = { nullptr, (int) il };
             n_enabled++;
             last_moe_layer = (int) il;
@@ -706,16 +706,16 @@ struct llama_moe_slot_runtime::impl {
             const char * e = std::getenv("LLAMA_MOE_MATMUL_SPLIT");
             matmul_split = e ? std::atoi(e) : 0;
             if (matmul_split > 0) {
-                moe_log("matmul-split: 末尾 %d 个位置的缺失专家延后读取（读与算重叠）",
+                moe_log("matmul-split: defer reads for missing experts at the last %d positions (overlap reads with compute)",
                         (int) matmul_split);
             }
         }
 
-        // decode 窗口那一套绑定要等 resolve_decode_window() —— 它依赖 shared_bank
-        // 和 last_moe_layer，两者都在上面的层循环里才确定。
+        // Binding the decode-window tensors must wait until resolve_decode_window(); it depends on shared_bank
+        // and last_moe_layer, both of which are determined only in the layer loop above.
         if (decode_window > 0) {
-            // 模型侧每层张量的宽度是 c_il + K（缓存区 + 预读暂存区），**按层不同**。
-            // 见 qwen35moe.cpp 与 install_prefetch_into_window 的分区说明。
+            // The per-layer tensor width on the model side is c_il + K (cache region + prefetch staging region) and **varies by layer**.
+            // See the partition description in qwen35moe.cpp and install_prefetch_into_window.
             int n_dec = 0;
             std::string fail;
             for (size_t il = 0; il < model.layers.size() && fail.empty(); ++il) {
@@ -757,9 +757,9 @@ struct llama_moe_slot_runtime::impl {
                 }
             }
             if (!fail.empty()) {
-                // 绑不上就退回共享 bank（那是正确路径），但必须**大声**报出来 ——
-                // 静默回退会让人以为窗口生效了，测出来的数是假的。
-                moe_log("decode-cache: 绑定失败，回退到共享 bank（窗口关闭）。原因: %s",
+                // If binding fails, fall back to the shared bank (the correct path), but log it **loudly** —
+                // a silent fallback would suggest the window is active and make benchmark results misleading.
+                moe_log("decode-cache: binding failed; falling back to shared bank (window disabled). Reason: %s",
                         fail.c_str());
                 for (auto & st : layers) {
                     st.dec_bindings.clear();
@@ -768,7 +768,7 @@ struct llama_moe_slot_runtime::impl {
                 }
                 decode_window = 0;
             } else {
-                moe_log("decode-cache: %d 层绑定 decode 张量（每层 %d = cache %d + prefetch %d slot，pack %s）",
+                moe_log("decode-cache: bound decode tensors for %d layers (%d slots/layer = %d cache + %d prefetch, pack %s)",
                         n_dec, (int) (decode_window + prefetch_slots), (int) decode_window,
                         (int) prefetch_slots, layers[0].dec_pack_ok ? "ok" : "off");
             }
@@ -777,53 +777,53 @@ struct llama_moe_slot_runtime::impl {
         prewarm_init();
     }
 
-    /// 预读专用：把一个 expert 读进**目标层自己的窗口**（按窗口 LRU 挑 slot）。
+    /// Prefetch only: read an expert into the **target layer's own window**, choosing a slot with the window LRU.
     ///
-    /// 与 process() 的安装路径共用同一套 slot 选择规则，所以预读的成果对那层来说
-    /// 就是一次普通的缓存命中 —— 不需要乒乓区、也不需要事后搬运。
+    /// Shares the same slot-selection rules as process() installation, so the prefetch result is
+    /// an ordinary cache hit for that layer — no ping-pong region and no later copy needed.
     ///
-    /// 调用时机保证安全：预读在层 L-1 的 process() 里 arm、在层 L 的 process()
-    /// 开头 take() 处等它结束，所以 worker 动层 L 的窗口时，层 L 没有在跑。
-    /// 清空一层缓存的映射表。
+    /// The call sequence guarantees safety: prefetch is armed during layer L-1's process(), and layer L's process()
+    /// waits for it at take() near the start, so layer L is not executing while the worker modifies its window.
+    /// Clear a layer's cache mapping table.
     ///
-    /// 保留 `kSlotPending`：那是预读 worker 已认领、正在写的 slot。正常路径上
-    /// 清空只发生在 prefill→decode 边界（那时没有 worker 在飞），但保留判断更安全
-    /// —— 否则会把 worker 的位置标成空闲，主路径分配过去就撞车了。
+    /// Preserve `kSlotPending`: the prefetch worker has claimed that slot and is writing to it. Normally this clear
+    /// occurs only at the prefill-to-decode boundary (when no worker is active), but preserving the check is safer —
+    /// otherwise the worker's slot could be marked free and allocated by the main path, causing a collision.
     static void clear_layer_cache(layer_state & st) {
         for (auto & e : st.slot_to_expert) {
             if (e != kSlotPending) {
                 e = kSlotFree;
             }
         }
-        // expert_to_slot 不能整体清：pending 的专家此时还没登记，所以直接全清是安全的。
+        // Do not clear expert_to_slot wholesale: pending experts have not been registered yet, so clearing all of it is safe.
         std::fill(st.expert_to_slot.begin(), st.expert_to_slot.end(), kSlotFree);
     }
 
-    /// 预读：把一个预测专家读进**目标层自己的窗口**，与缓存共用同一片 slot 池。
+    /// Prefetch: read a predicted expert into the **target layer's own window**, sharing its slot pool with the cache.
     ///
-    /// 关键设计：**锁内只做「认领 slot」，读盘在锁外，读完再锁内「发布」**。
+    /// Key design: **claim the slot under the lock, read from disk without the lock, then publish under the lock**.
     ///
-    /// 为什么必须这样：以前这个函数从头到尾持着 `st.mutex` 读盘（每次读 ~1ms），
-    /// 而主线程的 `process()` 要拿同一把锁 —— 于是主线程被 worker 的读盘挡住，
-    /// 实测每 token 白等 43ms。**这才是「缓存与预读互斥」的真正原因**，
-    /// 不是两者本质上冲突。
+    /// Why this is necessary: previously, this function held `st.mutex` for the whole disk read (about 1 ms per read),
+    /// while the main thread's process() needed the same lock, so disk I/O by the worker blocked the main thread.
+    /// Measurements showed 43 ms of wasted time per token. **That was the real source of cache/prefetch interference**,
+    /// not an inherent conflict between caching and prefetch.
     ///
-    /// 认领期间该 slot 标成 `kSlotPending`：主路径分配/淘汰都会跳过它，
-    /// 所以主线程既不会覆盖它、也不会误用未写完的内容。
-    /// 认领一个槽位并标 `kSlotPending`（内容尚未写入）。**调用方必须已持 st.mutex**。
+    /// While claimed, the slot is marked `kSlotPending`; main-path allocation and eviction both skip it,
+    /// so the main thread neither overwrites it nor uses data that has not been fully written.
+    /// Claim a slot and mark it `kSlotPending` (contents not written yet). **Caller must already hold st.mutex.**
     ///
-    /// `cache_only` 决定从哪一段挑：
-    ///   true  → 只在**缓存区** [window_start, window_start + c_il) 里挑（预热用；
-    ///           预热的是「会跨 token 复用」的专家，本就该进缓存区）
-    ///   false → 在**预读区**里挑（预读用；统一模式下就是整层窗口）
+    /// `cache_only` determines which region to choose from:
+    ///   true  → choose only from the **cache region** [window_start, window_start + c_il) (for prewarming;
+    ///           prewarmed experts are expected to be reused across tokens and therefore belong in the cache region)
+    ///   false → choose from the **prefetch region** (for prefetch; the entire layer window in unified mode)
     ///
-    /// 返回 -1 = 该专家已在窗口里，或无处可放。
+    /// Returns -1 if the expert is already in the window or there is no free slot.
     int32_t claim_slot_in_window(layer_state & st, int32_t expert, bool cache_only) {
         if (decode_window <= 0 || expert < 0 || expert >= n_expert) {
             return -1;
         }
         if (st.expert_to_slot[(size_t) expert] >= 0) {
-            return -1;   // 已经在（缓存区或预读区）—— 白读，跳过
+            return -1;   // Already present (in the cache or prefetch region); skip the redundant read
         }
         const int32_t w_il = st.window_width > 0 ? st.window_width : (decode_window + prefetch_slots);
         const int32_t c_il = std::max<int32_t>(1, w_il - prefetch_slots);
@@ -859,14 +859,14 @@ struct llama_moe_slot_runtime::impl {
         if (evicted >= 0) {
             st.expert_to_slot[(size_t) evicted] = kSlotFree;
         }
-        st.slot_to_expert[(size_t) slot] = kSlotPending;   // 认领，内容尚未写入
+        st.slot_to_expert[(size_t) slot] = kSlotPending;   // Claimed; contents have not been written yet
         return slot;
     }
 
-    /// 读完后登记为有效缓存条目。**调用方必须已持 st.mutex**。
-    /// 返回是否真的登记（专家在读盘期间被主路径抢先装好时不登记，丢弃这份）。
+    /// Register a completed read as a valid cache entry. **Caller must already hold st.mutex.**
+    /// Returns whether it was registered (if the main path loaded the expert during the read, discard this copy).
     bool publish_slot_in_window(layer_state & st, int32_t expert, int32_t slot) {
-        // 读盘期间主路径可能已经把同一个专家装好了（它自己读的），那就丢弃这份。
+        // The main path may have loaded this expert during the read; if so, discard the duplicate.
         if (st.expert_to_slot[(size_t) expert] >= 0) {
             st.slot_to_expert[(size_t) slot] = kSlotFree;
             return false;
@@ -887,12 +887,12 @@ struct llama_moe_slot_runtime::impl {
             return;
         }
 
-        // 只在**预读暂存区** [window_start + c, window_start + c + K) 里分配。
-        // 这一块每步重填，不参与跨 token 的 LRU 淘汰 —— 所以预读**不会**把缓存的
-        // 条目换出去。这是「缓存 + 预读」并集覆盖的前提：
-        //   预测到的专家已在缓存区 -> 白读（跳过，见下面的检查）
-        //   不在缓存区 -> 读进暂存区，本层用时不落关键路径
-        // 统一模式下预读可写在整层窗口里（见 prefetch_unified 的说明）。
+        // Allocate only within the **prefetch staging region** [window_start + c, window_start + c + K).
+        // This region is refilled every step and is not part of cross-token LRU eviction, so prefetch **does not evict** cache
+        // entries. This is essential to the union coverage from combining caching and prefetch:
+        //   If the predicted expert is already in the cache region, skip the redundant read (checked below).
+        //   Otherwise, read it into staging so that use by this layer does not land on the critical path.
+        // In unified mode, prefetch may use the entire layer window (see the prefetch_unified comment).
         int32_t slot = -1;
         {
             std::lock_guard<std::mutex> lock(st.mutex);
@@ -902,32 +902,32 @@ struct llama_moe_slot_runtime::impl {
             return;
         }
 
-        // 锁外读盘：这一步不再阻塞主线程。
+        // Read from disk outside the lock; this no longer blocks the main thread.
         read_expert_directv(st, expert, slot, true);
 
         std::lock_guard<std::mutex> lock(st.mutex);
         publish_slot_in_window(st, expert, slot);
     }
 
-    /// ── 缓存预热（LLAMA_MOE_PREWARM）───────────────────────────────────
+    /// ── Cache prewarming (LLAMA_MOE_PREWARM) ───────────────────────────────────
     ///
-    /// 每轮生成开始时各层窗口都是空的（进窗口模式时整表清空 / park 后又清）。
-    /// 预热把一张**静态表**（每层若干专家 id）读进各层 decode 窗口，让第一步不再是
-    /// 「全 miss」。
+    /// Each layer window is empty at the start of a generation round (cleared when entering window mode and again by park).
+    /// Prewarming reads a **static table** of expert IDs for each layer into its decode window, so the first step is no longer
+    /// an "all-miss" step.
     ///
-    /// 关键：decode 窗口与 prefill 段**物理分离**（见 qwen35moe.cpp 的 base 布局），
-    /// 所以只要在 prefill 之前把数据读进去，prefill 不会覆盖它，阶段切换时只需
-    /// **重新发布映射**（`publish_prewarm_placed`，纯整数操作），不必重读盘。
-    /// 这就是 App 侧「mmproj 卸载后、prefill 之前」调用 `prewarm_experts()` 的意义：
-    /// 那笔读完全离开首 token 的关键路径。
+    /// Key point: the decode window is **physically separate** from the prefill region (see the base layout in qwen35moe.cpp),
+    /// so prefill cannot overwrite data read before prefill. At the phase switch, only the mappings need to be
+    /// **republished** (`publish_prewarm_placed`, integer operations only); the experts need not be read again.
+    /// This is why the app calls `prewarm_experts()` after unloading mmproj and before prefill:
+    /// those reads are completely removed from the first token's critical path.
     ///
-    /// 三段式（与 install_prefetch_into_window 同构，但批量做）：
-    ///   1. 认领：逐层持锁，给每个专家在**缓存区**找空位 / 淘汰最老的；
-    ///   2. 读盘：不持任何层锁，用 io_threads 个线程并行读；
-    ///   3. 发布：逐层持锁，并记下落位（层,专家,slot）供阶段切换重挂。
+    /// Three phases (structured like install_prefetch_into_window, but batched):
+    ///   1. Claim: hold each layer lock and find a free slot / evict the oldest entry in the **cache region** for each expert;
+    ///   2. Read: hold no layer locks and read concurrently using io_threads threads;
+    ///   3. Publish: lock each layer, publish mappings, and record placements (layer, expert, slot) for reattachment at phase switch.
     ///
-    /// `cur_layer` 的锁**已被调用方（process）持有**时传该层号；从公开 API 调用
-    /// （此时不持任何层锁）传 -1。`std::mutex` 不可重入，再锁会自死锁。
+    /// Pass the layer number in `cur_layer` if the caller (process) already holds that layer's lock; pass -1 when called
+    /// from the public API (no layer lock is held). `std::mutex` is not recursive, so locking it again would deadlock.
     void prewarm_windows(int cur_layer) {
         if (!prewarm_enabled || decode_window <= 0) {
             return;
@@ -1027,20 +1027,20 @@ struct llama_moe_slot_runtime::impl {
                 pub_all();
             }
         }
-        // 记下落位：阶段切换（prefill → decode）时用它们「重新发布」映射，不必重读盘。
+        // Record placements so mappings can be republished at the prefill-to-decode switch without rereading the data.
         prewarm_placed = std::move(placed);
         prewarm_ready = !prewarm_placed.empty();
 
-        moe_log("prewarm: 表 %zu 专家 -> 认领 %d / 读入 %d / 发布 %zu，%.1f MiB，wall=%.1f ms "
-                "(%d 线程，缓存区)",
+        moe_log("prewarm: table %zu experts -> claimed %d / read %d / published %zu, %.1f MiB, wall=%.1f ms "
+                "(%d threads, cache region)",
                 n_req, n, (int) n_read.load(), n_pub,
                 (double) n_bytes.load() / (1024.0 * 1024.0), ms_of(now_ns() - t0), n_th);
     }
 
-    /// 阶段切换（prefill → decode）时用预热落位记录**重新发布**映射。
+    /// Republish mappings from the prewarm placement records when switching from prefill to decode.
     ///
-    /// 数据本身还在（decode 段与 prefill 段物理分离），只是切换时映射表被清了 ——
-    /// 所以这里纯整数操作、不读盘。`cur_layer` 的锁已由调用方持有（同 prewarm_windows）。
+    /// The data is still present (decode and prefill regions are physically separate); only the mapping table was cleared —
+    /// so this performs integer operations only, without disk I/O. The caller already holds `cur_layer`'s lock (as in prewarm_windows).
     void publish_prewarm_placed(int cur_layer) {
         for (const auto & p : prewarm_placed) {
             if (p.layer < 0 || p.layer >= (int) layers.size()) {
@@ -1055,8 +1055,8 @@ struct llama_moe_slot_runtime::impl {
                 continue;
             }
             auto do_pub = [&]() {
-                // 刚清过映射（全部 kSlotFree），这里直接登记。
-                // 若该 slot/专家已被占用（理论上不会），跳过以免制造冲突。
+                // The mapping was just cleared (all entries are kSlotFree), so register directly.
+                // If the slot or expert is already occupied (not expected), skip it to avoid a conflict.
                 if (st.slot_to_expert[(size_t) p.slot] == kSlotFree &&
                     st.expert_to_slot[(size_t) p.expert] < 0) {
                     st.slot_to_expert[(size_t) p.slot] = p.expert;
@@ -1073,58 +1073,58 @@ struct llama_moe_slot_runtime::impl {
         }
     }
 
-    /// 公开入口（`llama_moe_prewarm_experts`）：把静态表读进各层 decode 窗口并登记映射。
-    /// 在 prefill 之前、空闲期调用（App：mmproj 卸载后）。调用期间不得有 decode 在飞。
+    /// Public entry point (`llama_moe_prewarm_experts`): read the static table into each layer's decode window and publish mappings.
+    /// Call while idle and before prefill (app: after unloading mmproj). No decode operation may be in flight.
     void prewarm_experts() {
         if (!prewarm_enabled) {
             return;
         }
-        prewarm_windows(-1);   // -1 = 不持任何层锁，全部自取
+        prewarm_windows(-1);   // -1 = no layer lock held; acquire locks as needed
     }
 
-    /// 决定 decode 缓存的窗口宽度，并把结果打出来。
+    /// Determine the decode-cache window width and log the result.
     ///
-    /// 为什么 prefill 用不了窗口：实测 prefill 一层要用 105~215 个专家（`unique/l`），
-    /// 而窗口只有 bank/40 个 slot，根本装不下。所以 prefill 必须保持「整块 bank + 逐层清空」，
-    /// decode 才切窗口 —— 两者是天然分离的阶段，在 `process()` 里按 `n_tokens == 1` 切换。
+    /// Why prefill cannot use the window: measurements show 105–215 experts per layer during prefill (`unique/l`),
+    /// far more than the bank/40 slots available. Prefill must therefore keep the full bank and clear it per layer;
+    /// decode can use windows instead. They are naturally separate phases, switched in process() based on `n_tokens == 1`.
     void resolve_decode_window() {
         const char * s = std::getenv("LLAMA_MOE_DECODE_WINDOW");
         if (!s || !*s) {
-            moe_log("decode-cache: off（设 LLAMA_MOE_DECODE_WINDOW 开启，留空=按 bank 自动取最大）");
+            moe_log("decode-cache: off (set LLAMA_MOE_DECODE_WINDOW to enable; leave empty to use the bank maximum)");
             return;
         }
         if (!shared_bank) {
-            moe_log("decode-cache: off（仅共享 bank 模式支持按层窗口）");
+            moe_log("decode-cache: off (per-layer windows require shared-bank mode)");
             return;
         }
-        // 窗口宽度以**模型侧**为唯一来源（`moe_decode_window()`）。
-        // 模型加载时按它建了张量布局，运行时若自己另算一遍就会对不上 ——
-        // 而且旧的上限（bank / 层数）属于共享张量方案，现在不再成立：
-        // 每层有自己的张量，c 只受 RAM 和 ne[2] <= 1024 约束。
+        // The **model side** (`moe_decode_window()`) is the sole source of window width.
+        // Tensor layout was built from it during model loading; calculating a different width at runtime would mismatch —
+        // and the old limit (bank / layer count) applied to shared tensors and is no longer valid:
+        // each layer has its own tensor, so c is limited only by RAM and ne[2] <= 1024.
         const int32_t want = model.moe_decode_window();
         if (want < 1) {
-            moe_log("decode-cache: off（模型侧未开启窗口）");
+            moe_log("decode-cache: off (window is not enabled on the model side)");
             return;
         }
         decode_window = want;
-        // 预读暂存区大小 = 预读深度（K）。没开预读就是 0，等于退回「只有缓存区」。
+        // Prefetch staging size equals prefetch depth (K). If prefetch is disabled, it is 0, leaving only the cache region.
         prefetch_slots = lookahead.enabled ? std::max(0, (int32_t) lookahead.depth) : 0;
         {
-            // 默认统一 LRU：预读与主路径共用整个窗口 (c+K)。
-            // `LLAMA_MOE_PREFETCH_UNIFIED=0` 退回分区模式（只作 A/B 用）。
+            // Unified LRU by default: prefetch and the main path share the entire window (c+K).
+            // Set `LLAMA_MOE_PREFETCH_UNIFIED=0` to revert to partitioned mode (for A/B testing only).
             const char * u = std::getenv("LLAMA_MOE_PREFETCH_UNIFIED");
             prefetch_unified = !(u && *u && *u == '0');
-            moe_log("decode-cache: %s（窗口 %d slot，K=%d）",
-                    prefetch_unified ? "预读与缓存共用一个 LRU 窗口" : "预读/缓存分区",
+            moe_log("decode-cache: %s (window %d slots, K=%d)",
+                    prefetch_unified ? "prefetch and cache share one LRU window" : "partitioned prefetch/cache",
                     (int) (decode_window + prefetch_slots), (int) prefetch_slots);
         }
 
-        // 各层窗口起点**不再是 il*c** —— 现在每层有自己的 decode 张量
-        // （base 上的 view），它的 slot 空间就是 [0, 宽度)，所以起点恒为 0。
-        // 这一点让运行时更简单：层间天然不冲突。
+        // Window starts are **no longer il*c** — each layer now has its own decode tensor
+        // (a view into base), with slot space [0, width), so the start is always 0.
+        // This simplifies runtime handling: layers cannot conflict with one another.
         //
-        // **宽度按层**：模型侧已按 LLAMA_MOE_LAYER_WINDOWS 建好布局（base 容量是
-        // 各层宽度之和），这里必须用**同一份**数据，否则张量对不上。
+        // **Width varies by layer**: the model side has already laid out tensors according to LLAMA_MOE_LAYER_WINDOWS (base capacity is
+        // the sum of all layer widths), so this must use **the exact same** data or the tensor layout will mismatch.
         {
             const std::vector<int32_t> per_layer_c = model.moe_layer_windows();
             layer_width.assign(layers.size(), 0);
@@ -1135,24 +1135,24 @@ struct llama_moe_slot_runtime::impl {
                 layers[il].window_width = w;
                 layer_width[il] = w;
             }
-            // 打印一下分布，确认按层生效
+            // Print the distribution to verify that per-layer sizing is active.
             std::string dist;
             for (size_t il = 0; il < layer_width.size() && il < 6; ++il) {
                 dist += format("%zu:%d ", il, (int) layer_width[il]);
             }
-            moe_log("decode-cache: 按层宽度 %s（前几层 %s）",
-                    (getenv("LLAMA_MOE_LAYER_WINDOWS") ? "on" : "off（均匀）"), dist.c_str());
+            moe_log("decode-cache: per-layer widths %s (first few layers: %s)",
+                    (getenv("LLAMA_MOE_LAYER_WINDOWS") ? "on" : "off (uniform)"), dist.c_str());
         }
 
-        // ── 窗口覆盖多大的批宽 ──────────────────────────────────────────────
+        // ── How large a batch can the window cover? ──────────────────────────────
         //
-        // 单 token decode 之外，投机验证（DSpark）也会送进批宽 = n_max+1 的小批次。
-        // 让它们走窗口，吃的是**跨轮**的专家复用（连续解码同一段文本，路由高度重合）。
-        // 上限由**容量**决定：必须保证「该批宽在最坏情况下的专家并集」装得进缓存区。
-        //   最坏并集 = min(行数 × top-k, n_expert)——每行最多 top-k 个，全库只有 n_expert 个。
+        // In addition to single-token decode, speculative verification (DSpark) submits small batches with width n_max+1.
+        // Letting them use the window enables **cross-round** expert reuse (consecutive decode steps have highly overlapping routing).
+        // The limit is capacity-based: the worst-case union of experts for the batch must fit in the cache region.
+        //   Worst-case union = min(rows × top-k, n_expert); each row uses at most top-k, and there are n_expert total experts.
         //
-        // 取**各层里最窄的那个**来夹：窗口可逐层不同（LLAMA_MOE_LAYER_WINDOWS），
-        // 夹紧必须对最窄的层也成立，否则那一层会在 process() 里抛异常。
+        // Clamp using the **narrowest layer**, since per-layer widths can vary (LLAMA_MOE_LAYER_WINDOWS);
+        // the clamp must fit even the narrowest layer or process() will throw for that layer.
         {
             const char * rows_env = std::getenv("LLAMA_MOE_WINDOW_MAX_ROWS");
             const int32_t rows_want = std::max(1, rows_env && *rows_env ? atoi(rows_env) : 1);
@@ -1180,34 +1180,34 @@ struct llama_moe_slot_runtime::impl {
             window_max_rows = rows;
 
             if (rows != rows_want) {
-                moe_log("decode-cache: 缓存区只有 %d 格，装不下 %d 行的最坏并集（%d），"
-                        "窗口适用的批宽从 %d 夹到 %d",
+                moe_log("decode-cache: only %d cache slots; worst-case union for %d rows is %d, "
+                        "so the supported window batch width is clamped from %d to %d",
                         (int) cache_min, (int) rows_want,
                         (int) std::min(rows_want * n_used, n_expert), (int) rows_want, (int) rows);
             }
-            moe_log("decode-cache: 窗口覆盖批宽 1..%d%s", (int) window_max_rows,
-                    window_max_rows > 1 ? "（投机验证也走窗口）" : "（只服务单 token decode）");
+            moe_log("decode-cache: window covers batch widths 1..%d%s", (int) window_max_rows,
+                    window_max_rows > 1 ? " (speculative verification also uses the window)" : " (single-token decode only)");
         }
 
-        // 预读**保留**，并改成写进目标层自己的窗口（见 install_prefetch_into_window）。
+        // **Keep prefetch**, but have it write into the target layer's own window (see install_prefetch_into_window).
         //
-        // 为什么不关掉它：预读的字节是在上一层计算期间并发读的，只要
-        // `预读字节 / 带宽 <= 单层计算时间` 就完全被隐藏 —— 那部分是白赚的。
-        // 真正加在耗时上的是**关键路径**字节（卡住下一层开始的那些）。
-        // 缓存的另一个作用正是把预读从「超出预算、部分暴露」压回「完全隐藏」：
-        //   无缓存 depth 8: 预读 14.2 MiB/层 → 8.2ms > 6ms 预算  ❌
-        //   缓存 24 + K=8 : 预读 6.6 MiB/层 → 3.8ms < 6ms 预算  ✅
-        // 所以两者是互补的，不该二选一。
+        // Why not disable it? Prefetch reads bytes concurrently while the previous layer is computing, so if
+        // `prefetch bytes / bandwidth <= one layer's compute time`, the reads are fully hidden and effectively free.
+        // Only bytes on the **critical path** (those that delay the next layer) add to elapsed time.
+        // Caching also helps turn prefetch from "over budget and partly exposed" into "fully hidden":
+        //   No cache, depth 8: 14.2 MiB/layer -> 8.2 ms > 6 ms budget  (over budget)
+        //   Cache 24 + K=8: 6.6 MiB/layer -> 3.8 ms < 6 ms budget (within budget)
+        // The two mechanisms complement each other; they should not be treated as alternatives.
         if (lookahead.enabled && !lookahead.window_mode) {
             lookahead.window_mode = true;
-            moe_log("decode-cache: 预读保留，改为写进目标层窗口（depth=%d）",
+            moe_log("decode-cache: keeping prefetch; redirecting it to the target layer window (depth=%d)",
                     (int) lookahead.depth);
         }
 
         const int32_t n_moe_layers = model.moe_experts_layer_count();
         const size_t total = (size_t) decode_window * (size_t) n_moe_layers;
-        moe_log("decode-cache: on cache=%d + prefetch=%d slots/layer × %d 层 = %zu slots "
-                "(%.0f MiB，与 %d-slot 的 prefill 共享 bank 同处一块 base)",
+        moe_log("decode-cache: on, cache=%d + prefetch=%d slots/layer × %d layers = %zu slots "
+                "(%.0f MiB, sharing one base allocation with the %d-slot prefill bank)",
                 (int) decode_window, (int) prefetch_slots, (int) n_moe_layers, total,
                 (double) total * (double) layers[0].pack_bytes / 1024.0 / 1024.0,
                 (int) n_slots);
@@ -1229,7 +1229,7 @@ struct llama_moe_slot_runtime::impl {
                     (unsigned long long) miss_pos_steps, s.c_str());
         }
         if (miss_per_layer_steps > 0 && decode_window > 0) {
-            // 逐层 miss 分布：判断「每层都有几个」还是「少数层很多」。
+            // Per-layer miss distribution: determine whether every layer has a few misses or only a few layers have many.
             std::string s;
             for (size_t il = 0; il < miss_per_layer.size(); ++il) {
                 if (miss_per_layer[il] == 0) continue;
@@ -1323,10 +1323,10 @@ struct llama_moe_slot_runtime::impl {
         state.pack_bytes = state.pack_stride;
     }
 
-    /// LLAMA_MOE_F_NOCACHE：experts 读是否绕过 page cache。
-    ///   未设 / "0" → 全程不绕（默认）
-    ///   "auto"     → 按阶段（prefill 绕、decode 不绕）
-    ///   "1"        → 全程绕过
+    /// LLAMA_MOE_F_NOCACHE: whether expert reads bypass the page cache.
+    ///   unset / "0" → never bypass (default)
+    ///   "auto"     → phase-dependent (bypass during prefill, not during decode)
+    ///   "1"        → always bypass
     static int nocache_mode() {
         static const int m = [] {
             const char * e = std::getenv("LLAMA_MOE_F_NOCACHE");
@@ -1343,21 +1343,21 @@ struct llama_moe_slot_runtime::impl {
         return m < 0 ? want_nocache.load(std::memory_order_relaxed) : m != 0;
     }
 
-    /// 把已打开的 experts fd 的 F_NOCACHE 拨到 `on`。只改缓存行为，不动数据。
+    /// Toggle F_NOCACHE on already-open expert file descriptors. Changes cache behavior only, not data.
     void apply_experts_nocache(bool on) {
 #ifdef __APPLE__
         std::lock_guard<std::mutex> lock(fd_mutex);
         for (const auto & kv : fds) {
             if (fcntl(kv.second, F_NOCACHE, on ? 1 : 0) != 0) {
-                moe_log("F_NOCACHE 切换失败: %s", std::strerror(errno));
+                moe_log("F_NOCACHE switch failed: %s", std::strerror(errno));
             }
         }
 #endif
-        // 只在每个方向各打一次，避免长会话刷屏。
+        // Log each transition direction only once to avoid flooding long sessions.
         static bool logged[2] = { false, false };
         if (!logged[on ? 0 : 1]) {
             logged[on ? 0 : 1] = true;
-            moe_log("experts 读%s page cache（%s 阶段）", on ? "绕过" : "经过",
+            moe_log("expert reads %s the page cache (%s phase)", on ? "bypass" : "use",
                     on ? "prefill" : "decode");
         }
     }
@@ -1375,7 +1375,7 @@ struct llama_moe_slot_runtime::impl {
 #else
         const int fd = open(path.c_str(), O_RDONLY | O_CLOEXEC);
         if (experts_nocache_desired() && fcntl(fd, F_NOCACHE, 1) != 0) {
-            moe_log("F_NOCACHE 设置失败: %s", std::strerror(errno));
+            moe_log("F_NOCACHE configuration failed: %s", std::strerror(errno));
         }
 #endif
         if (fd < 0) {
@@ -1392,8 +1392,8 @@ struct llama_moe_slot_runtime::impl {
             for (int i = 0; i < niov; ++i) {
                 n += iov[i].iov_len;
             }
-            // 唯一能给出「完整 I/O」的埋点：主路径和预读 worker 都走这里。
-            // 只看 decode 行里的 bytes= 会漏掉预读读的字节（实测那是大头）。
+            // The only instrumentation point that captures **all I/O**: both the main path and prefetch worker pass through here.
+            // Looking only at bytes= on decode log lines misses prefetch reads (which were measured to be the bulk of the I/O).
             io_bytes_all.fetch_add(n, std::memory_order_relaxed);
             io_calls_all.fetch_add(1, std::memory_order_relaxed);
         }
@@ -1447,18 +1447,18 @@ struct llama_moe_slot_runtime::impl {
     // buffer and no second copy into the device buffer.
     int64_t read_expert_directv(const layer_state & state, int32_t expert, int32_t slot,
                                 bool window_mode = false) {
-        // 诊断：LLAMA_MOE_SKIP_READ=1 时走完所有记账但不真读盘。
+        // Diagnostic: LLAMA_MOE_SKIP_READ=1 performs all accounting but does not actually read from disk.
         //
-        // 目的是把「CPU 段 + 每层往返」的成本和「真读盘」的成本分开：
-        //   step(真实) - step(空读) = I/O 落在关键路径上的部分
-        //   step(空读) - 常驻基线     = 结构开销（40 次 GPU/CPU 往返 + 调度）
-        // 输出会是错的（专家内容是垃圾），只用来看时间。
-        // 诊断三态，用来把「读」与「写进 GPU 缓冲区」分开：
-        //   0（默认）正常：preadv 直接写进 slot 张量（GPU 可见）
-        //   1 dummy   ：preadv 读进一块 scratch —— 同样的 I/O，但不碰 GPU 缓冲区
-        //   2 skip    ：完全不读
-        // 判定：若 0 >> 1 ≈ 2 → 成本在「写 GPU 缓冲区」（缓存行失效）；
-        //       若 0 ≈ 1 >> 2 → 单纯是 I/O 本身。
+        // This separates the cost of the CPU section plus per-layer round trips from the cost of real disk reads:
+        //   step (real) - step (empty read) = I/O exposed on the critical path
+        //   step (empty read) - resident baseline = structural overhead (40 GPU/CPU round trips + scheduling)
+        // The output will be incorrect (expert contents are garbage); use this only to measure timing.
+        // Three diagnostic modes separate reading from writing into the GPU buffer:
+        //   0 (default) normal: preadv writes directly into the slot tensor (GPU-visible)
+        //   1 dummy: preadv reads into a scratch buffer — same I/O, but does not touch the GPU buffer
+        //   2 skip: do not read at all
+        // Interpretation: if 0 >> 1 ≈ 2, the cost is in writing the GPU buffer (cache-line invalidation);
+        //               if 0 ≈ 1 >> 2, the cost is the I/O itself.
         static const int mode = [] {
             const char * d = std::getenv("LLAMA_MOE_DUMMY_READ");
             if (d && *d && *d != '0') return 1;
@@ -1467,8 +1467,8 @@ struct llama_moe_slot_runtime::impl {
             return 0;
         }();
 
-        // decode 阶段读进**本层自己的窗口张量**（base 上的 view），prefill 读进共享那段。
-        // 两套的张量、文件偏移、步长都不同，所以整组一起切。
+        // During decode, read into this layer's own window tensor (a view into base); during prefill, read into the shared region.
+        // The tensors, file offsets, and strides differ, so switch the entire set together.
         const std::vector<binding> & bindings = window_mode ? state.dec_bindings   : state.bindings;
         const std::vector<size_t>  & order    = window_mode ? state.dec_pack_order : state.pack_order;
         const std::string          & path     = window_mode ? state.dec_pack_path : state.pack_path;
@@ -1486,8 +1486,8 @@ struct llama_moe_slot_runtime::impl {
             max_exp = std::max(max_exp, bindings[order[(size_t) i]].entry->bytes_per_expert);
         }
         if (mode == 1) {
-            // dummy：读进一块常驻 scratch（不碰 GPU 缓冲区）。同样是真读盘，
-            // 所以 I/O 量与正常模式一致，差别只有「数据落到哪里」。
+            // dummy: read into a persistent scratch buffer (not the GPU buffer). This still performs real disk I/O,
+            // so I/O volume matches normal mode; only the destination differs.
             static std::vector<uint8_t> scratch;
             if (scratch.size() < max_exp) {
                 scratch.resize(max_exp);
@@ -1510,14 +1510,14 @@ struct llama_moe_slot_runtime::impl {
         const size_t offset = base + (size_t) expert * stride;
 
         if (mode == 2) {
-            // 记账照做（让上层以为读成功了），但不落盘 —— 用于隔离 I/O 与结构开销。
+            // Keep accounting as if the read succeeded, but do not access the disk — used to isolate I/O from structural overhead.
             stats.n_miss.fetch_add(1, std::memory_order_relaxed);
             return 0;
         }
 
-        // LLAMA_MOE_READ_DELAY_US：给每次读加固定延迟。
-        // 用来判断「读时间是否 1:1 落在关键路径上」—— 若总时间按 delay × 读次数
-        // 等量增长，说明读在关键路径上是线性的；若增长更多，说明有放大效应。
+        // LLAMA_MOE_READ_DELAY_US: add a fixed delay to every read.
+        // Used to test whether read time lies 1:1 on the critical path: if total time increases by
+        // delay × read count, reads lie linearly on the critical path; a larger increase indicates amplification.
         static const int delay_us = [] {
             const char * d = std::getenv("LLAMA_MOE_READ_DELAY_US");
             return d ? std::atoi(d) : 0;
@@ -1588,18 +1588,18 @@ struct llama_moe_slot_runtime::impl {
         }
     }
 
-    // 统计 pending 的「连续段」结构，用来判断「合并相邻专家的读」是否可行。
+    // Count contiguous runs among pending entries to determine whether reads of adjacent experts can be merged.
     //
-    // 背景：experts 是 expert-major，expert k 的字节在文件里位于
-    // `base + k * expert_stride`，所以**专家 id 连号 == 文件地址连号**。
-    // 而 pending 是按 expert id 升序构建的，因此天然带着可用于合并的连续段。
+    // Background: experts are stored expert-major, so expert k's bytes are located at
+    // base + k * expert_stride in the file; therefore consecutive expert IDs mean consecutive file addresses.
+    // pending is built in ascending expert-ID order, so it naturally forms contiguous runs that can be merged.
     //
-    // 两类可合并：
-    //   1. slot 也连号 → 可以直接用一组 iovec 覆盖整段，**零拷贝**、syscall 数减到 1/段长
-    //   2. slot 不连号 → 得先读进 scratch 再散写到各 slot，多一次内存拷贝
+    // Two mergeable cases:
+    //   1. Slots are also consecutive -> one iovec can cover the whole run, with zero copies and one syscall per run
+    //   2. Slots are not consecutive -> read into scratch first, then scatter to each slot, requiring one extra memory copy
     //
-    // 共享 bank 的 prefill 里 LRU 每层清空、slot 从 0 顺序分配，而 pending 又是按
-    // expert 升序压入的，所以 1 类应该占绝大多数。这个统计就是来验证这一点的。
+    // In shared-bank prefill, LRU is cleared per layer and slots are allocated sequentially from 0; pending is also
+    // appended in ascending expert-ID order, so case 1 should dominate. These statistics verify that.
     static run_stats accumulate_runs(const std::vector<pending_install> & pending) {
         run_stats st;
         const size_t n = pending.size();
@@ -1608,7 +1608,7 @@ struct llama_moe_slot_runtime::impl {
         }
         size_t i = 0;
         while (i < n) {
-            size_t j = i + 1;   // 只按 expert 连号扩展，slot 单独判
+            size_t j = i + 1;   // Extend only across consecutive expert IDs; check slots separately
             while (j < n && pending[j].expert == pending[j - 1].expert + 1) {
                 ++j;
             }
@@ -1694,13 +1694,13 @@ struct llama_moe_slot_runtime::impl {
 
         t.n_th = std::max(1, std::min(moe_ssd_io_threads(), n));
         const int64_t wall0 = now_ns();
-        // 注意：单线程不能只调 read_one(0) —— 那只会装第一个专家，
-        // 其余 N-1 个被静默跳过，slot 里留着上一层/上一个 token 的旧权重，
-        // 模型输出会错但不报错。这条路径只在 io_threads==1 时进入，
-        // 默认 4 所以长期潜伏；把它做成可调后才会踩到。
-        // 单线程还有个副作用：pending 是按 expert id 升序构建的，而 experts 是
-        // expert-major（offset = base + expert * stride），所以单线程等于**严格
-        // 顺序读文件**，可能接近顺序读速率（实测比 4 线程的随机交织快）。
+        // Note: in single-thread mode, calling only read_one(0) would load only the first expert,
+        // silently skipping the remaining N-1 and leaving stale weights from the previous layer/token in their slots;
+        // the model output would be wrong without an error. This path is entered only when io_threads == 1,
+        // so it remained hidden for a long time because the default is 4; making it configurable exposed the bug.
+        // Single-thread mode has another effect: pending is built in ascending expert-ID order, while experts are
+        // expert-major (offset = base + expert * stride), so single-thread mode performs strictly sequential
+        // file reads and may approach sequential-read throughput (measured faster than interleaved random reads with 4 threads).
         if (t.n_th == 1) {
             for (int i = 0; i < n; ++i) {
                 read_one(i);
@@ -1751,9 +1751,9 @@ struct llama_moe_slot_runtime::impl {
     }
 
     bool should_log_ubatch(int n_tokens, uint64_t idx) const {
-        // LLAMA_MOE_LOG_EVERY_STEP=1：每步都打，供性能归因用。
-        // 稀疏打印时 counter 的累计窗口和 span 容易搞错（实测踩过），
-        // 逐步打印后 span 恒为 1，消费方不用做任何归一。
+        // LLAMA_MOE_LOG_EVERY_STEP=1: log every step for performance attribution.
+        // With sparse logging, it is easy to misread the counters' accumulation window and span (observed during testing);
+        // per-step logging keeps span fixed at 1, so consumers need no normalization.
         static const bool every = [] {
             const char * s = std::getenv("LLAMA_MOE_LOG_EVERY_STEP");
             return s && *s && *s != '0';
@@ -1774,7 +1774,7 @@ struct llama_moe_slot_runtime::impl {
         if (cur.n_layers <= 0) {
             return;
         }
-        // 本步的**完整** I/O：主路径 + 预读。用全局计数器的增量，避免口径混淆。
+        // Complete I/O for this step: main path + prefetch. Use global-counter deltas to avoid mixing accounting scopes.
         const uint64_t all_now = io_bytes_all.load(std::memory_order_relaxed);
         const uint64_t calls_now = io_calls_all.load(std::memory_order_relaxed);
         const int64_t proc_now = process_ns.load(std::memory_order_relaxed);
@@ -1803,9 +1803,9 @@ struct llama_moe_slot_runtime::impl {
         last_pf_hits = pf_hits_now;
         last_pf_pub  = pf_pub_now;
 
-        // 这些计数器只在 flush 时前进，而 flush 受 should_log_ubatch 节流。
-        // 所以必须把「本次 flush 覆盖了多少步」一起打出来，否则消费方会把
-        // 多步累计当成单步值（实测虚报过 24 倍）。`span=` 就是干这个的。
+        // These counters advance only on flush, and flushes are throttled by should_log_ubatch.
+        // Therefore, log how many steps this flush covers; otherwise consumers may interpret
+        // a multi-step total as a per-step value (it was overstated by 24x in testing). That is what span= indicates.
         const uint64_t span = idx > last_flush_idx ? idx - last_flush_idx : 1;
         last_flush_idx = idx;
         const double wall_s = cur.wall_ns / 1e9;
@@ -1835,7 +1835,7 @@ struct llama_moe_slot_runtime::impl {
             mibs,
             mib_of(all_delta),
             (unsigned long long) calls_delta,
-            // 真·带宽：完整字节 / 本步墙钟（含 compute，所以这是下限）。
+            // Actual bandwidth: total bytes / wall-clock time for this step (includes compute, so this is a lower bound).
             wall_s > 0.0 ? (double) all_delta / (1024.0 * 1024.0) / wall_s : 0.0,
             (unsigned long long) span,
             ms_of(proc_delta),
@@ -1857,15 +1857,15 @@ struct llama_moe_slot_runtime::impl {
         cur = ubatch_acc{};
     }
 
-    /// 整个进程的「合并读」可行性汇总。用来回答一个问题：
-    /// **把相邻专家的读合并成大 preadv，到底能减少多少次 syscall、传输会变成多大。**
+    /// Process-wide summary of whether merging reads is feasible. It answers one question:
+    /// How many syscalls can be saved, and how large will transfers become, if reads of adjacent experts are merged into larger preadv calls?
     void report_merge() {
         if (g_runs.experts <= 0) {
             return;
         }
         const double avg_run = (double) g_runs.experts / (double) g_runs.n;
         const double zc_pct  = 100.0 * (double) g_runs.ok_ex / (double) g_runs.experts;
-        // 假设全合并：syscall 数从「每专家一次」降到「每段一次」
+        // Assuming full merging: reduce syscall count from one per expert to one per run.
         const double syscall_ratio = (double) g_runs.n / (double) g_runs.experts;
         moe_log("merge-scan: experts=%d runs=%d avg_run=%.2f max_run=%d "
                 "zerocopy=%.1f%% scatter_experts=%d "
@@ -1894,52 +1894,52 @@ struct llama_moe_slot_runtime::impl {
     int n_enabled = 0;
     int n_pack_ok = 0;
     bool shared_bank = false;
-    // 按层 decode 缓存：每层分到 [layer*W, (layer+1)*W) 一段私有 slot 窗口，
-    // 窗口内 LRU 跨 token 保留。prefill 不用窗口（一层要用 100+ 专家，装不下 W），
-    // 仍然是「整块 bank + 每层清空」。
+    // Per-layer decode cache: each layer gets a private slot window [layer*W, (layer+1)*W),
+    // with LRU preserved across tokens within the window. Prefill does not use the window (100+ experts per layer exceed W),
+    // and continues to use the full bank, cleared once per layer.
     //
-    // W = 0 表示关闭（退回原行为：所有层共享全部 slot、每层清空）。
+    // W = 0 disables this (restores old behavior: all layers share all slots, cleared per layer).
     int32_t decode_window = 0;
-    /// 窗口适用的最大批宽（行数）。1 = 只服务单 token decode（旧行为）；更大的值让
-    /// 投机验证（DSpark，批宽 = n_max+1）这类**小批次**也走窗口，靠跨轮专家复用省读盘。
+    /// Maximum batch width (rows) supported by the window. 1 serves single-token decode only (legacy behavior); larger values let
+    /// small batches such as speculative verification (DSpark, batch width = n_max+1) use the window too, saving disk reads through cross-round expert reuse.
     ///
-    /// 由 LLAMA_MOE_WINDOW_MAX_ROWS 给出想要值，再由 resolve_decode_window() 按
-    /// 缓存区容量夹紧 —— 夹紧是必须的：装不下时 process() 是抛异常（运行期崩），
-    /// 不是降级。上限另外受「批宽 < 32」约束：再大就走 mul_mat_id 路径，寻址不到
-    /// 每层的 `.dec` 视图。
+    /// The requested value comes from LLAMA_MOE_WINDOW_MAX_ROWS, then resolve_decode_window() clamps it to cache capacity.
+    /// Clamping is necessary: if the batch does not fit, process() throws at runtime rather than falling back.
+    /// The upper bound is also constrained by batch width < 32; larger batches use mul_mat_id, which cannot address
+    /// each layer's `.dec` view.
     int32_t window_max_rows = 1;
-    /// 每层**预读暂存区**的 slot 数（= 预读深度 K）。
+    /// Number of slots in each layer's **prefetch staging region** (= prefetch depth K).
     ///
-    /// 为什么单列一块：预读的条目是「下一步可能用到」，与「跨 token 复用」是两种
-    /// 不同的价值。共用一个 LRU 时，预读会在窗口满时**把跨 token 的缓存条目淘汰掉**
-    /// —— 等于预读破坏缓存。分区之后两者互不干扰，覆盖变成**并集**：
-    ///   缓存区 [window_start, window_start + c)          跨 token LRU
-    ///   预读区 [window_start + c, window_start + c + K)  每步重填，不参与 LRU 淘汰
+    /// Why keep this separate: prefetched entries may be needed next step, while cross-token reuse has a different value.
+    /// With a shared LRU, prefetch evicts cross-token cache entries when the window fills,
+    /// meaning prefetch destroys the cache. Partitioning prevents interference; coverage becomes the union of:
+    ///   Cache region [window_start, window_start + c)          — cross-token LRU
+    ///   Prefetch region [window_start + c, window_start + c + K) — refilled every step, not subject to LRU eviction
     int32_t prefetch_slots = 0;
-    /// 每层窗口的总宽度（c_il + K），下标 = layer index。见 layer_state::window_width。
+    /// Total width of each layer's window (c_il + K), indexed by layer. See layer_state::window_width.
     std::vector<int32_t> layer_width;
-    /// 统一 LRU：预读与主路径共用**整个窗口**（不分区）。**默认开启**。
+    /// Unified LRU: prefetch and main path share the **entire window** (no partition). **Enabled by default.**
     ///
-    /// 为什么分区反而慢（实测，每 24 步）：
-    ///   分区   miss 53 | 预读写入 3022 | 用到的专家来自预读区 4568 | pmgmt 174ms
-    ///   统一   miss 29 | 预读写入 1932 | 用到的专家来自预读区  888 | pmgmt 101ms
-    /// 分区下预读区只保留 ~3 步（每步被重填），而 78% 被用到的专家都落在那里 ——
-    /// 于是「热专家」用完就被冲掉、下次重读。统一 LRU 让它们自然进入跨 token LRU。
+    /// Why partitioning is slower (measured over 24 steps):
+    ///   Partitioned: misses 53 | prefetch writes 3022 | used experts from prefetch region 4568 | pmgmt 174 ms
+    ///   Unified:     misses 29 | prefetch writes 1932 | used experts from prefetch region 888  | pmgmt 101 ms
+    /// With partitioning, the prefetch region retains entries for only ~3 steps (it is refilled every step), and 78% of used experts land there —
+    /// so hot experts are flushed immediately after use and must be reread. Unified LRU lets them naturally enter the cross-token LRU.
     ///
-    /// 分区当初是为了防「预读把缓存成批挤出去」，但那个前提已被 arm 时的过滤消掉：
-    /// 预读每层每步只新增约 2.4 个（而不是 8 个），不会造成成批淘汰。
+    /// Partitioning was originally intended to prevent prefetch from evicting many cache entries at once, but filtering during arm() removes that premise:
+    /// prefetch adds only about 2.4 new experts per layer per step (not 8), so it does not cause mass eviction.
     bool prefetch_unified = true;
     bool was_window = false;
-    /// 仅在 LLAMA_MOE_F_NOCACHE=auto（按阶段）时被翻转：prefill 绕、decode 不绕。
-    /// 必须 atomic：主线程在 process() 里写它时**不持** fd_mutex，而 fd_for() 会被
-    /// 预读 worker 的子线程调用并读它 → 无同步的并发读写。relaxed 够用：
-    /// 只需不撕裂，不依赖可见顺序。
+    /// Toggled only when LLAMA_MOE_F_NOCACHE=auto (phase-dependent): bypass during prefill, not during decode.
+    /// Must be atomic: the main thread writes it in process() without holding fd_mutex, while fd_for() is called
+    /// and reads it from a prefetch worker thread, causing unsynchronized concurrent access. relaxed is sufficient:
+    /// only atomicity matters; no ordering guarantee is needed.
     std::atomic<bool> want_nocache{false};
     int last_moe_layer = -1;
     uint64_t n_prefill_ubatch = 0;
     uint64_t n_decode_step = 0;
     ubatch_acc cur;
-    run_stats g_runs;   // 整进程累计；process() 只在 ith==0 上跑，单线程，无需原子
+    run_stats g_runs;   // Process-wide cumulative stats; process() runs only on ith == 0, single-threaded, so atomics are unnecessary
     std::vector<layer_state> layers;
     std::vector<map_userdata> userdata;
     std::unordered_map<std::string, int> fds;
@@ -1952,30 +1952,30 @@ struct llama_moe_slot_runtime::impl {
     std::atomic<bool> parked{false};
     std::mutex park_mutex;
 
-    // ── 命中率扫描（诊断，默认关闭）──────────────────────────────────────
-    // LLAMA_MOE_SWEEP=<path> 打开，把每个 decode 步、每一层的原始记录写成一行：
+    // ── Hit-rate sweep (diagnostics, disabled by default) ──────────────────────
+    // LLAMA_MOE_SWEEP=<path> enables this and writes one raw record per decode step and layer:
     //
-    //   L<layer> E:<本层真实用的专家> P:<上一层给本层预测的专家（按分数降序）>
+    //   L<layer> E:<experts actually used by this layer> P:<experts predicted for this layer by the previous layer, sorted by score descending>
     //
-    // 为什么 dump 原始数据而不是在 C++ 里算表：命中率只取决于路由本身，与硬件无关，
-    // 所以可以在 Mac 上跑一次、把文件拿来随便分析。dump 之后 cap / K 想怎么扫都行，
-    // 不用为每个组合重编译。分析脚本见项目文档里的 analyze_hits.py。
+    // Why dump raw data instead of computing tables in C++: hit rate depends only on routing, not hardware,
+    // so the file can be generated once on a Mac and analyzed anywhere. After dumping, sweep cap/K as desired
+    // without recompiling each combination. See analyze_hits.py in the project documentation.
     FILE * sweep_fp = nullptr;
-    std::vector<std::vector<int32_t>> sweep_pred;   // sweep_pred[L] = 给层 L 的预测（来自层 L-1）
+    std::vector<std::vector<int32_t>> sweep_pred;   // sweep_pred[L] = prediction for layer L (from layer L-1)
 
-    // ── 缓存预热表（LLAMA_MOE_PREWARM=<path>）────────────────────────────
-    // 文件：每行一层，行号 = 模型层号（与 sweep dump 的 `L<layer>` 同一编号），
-    // 行内是逗号/空白分隔的专家 id（`#` 起注释，空行/注释行不占层号）。
-    // 第一行 = 层 0，第二行 = 层 1……
+    // ── Cache prewarm table (LLAMA_MOE_PREWARM=<path>) ─────────────────────────
+    // File format: one layer per line; line number = model layer index (same numbering as L<layer> in sweep dumps),
+    // expert IDs on each line are comma- or whitespace-separated (# starts a comment; blank/comment lines do not count as layers).
+    // First line = layer 0, second line = layer 1, and so on.
     std::vector<std::vector<int32_t>> prewarm_table;
     bool prewarm_enabled = false;
 
-    /// 预热读入后的落位记录（层、专家、窗口内 slot 下标）。
-    /// 阶段切换时用它「重新发布」映射 —— 数据没被 prefill 碰（物理分离），只有映射被清。
+    /// Placement records after prewarming (layer, expert, slot index within the window).
+    /// Used to republish mappings at phase switches — prefill does not touch the data (physically separate); only mappings are cleared.
     struct prewarm_place { int32_t layer; int32_t expert; int32_t slot; };
     std::vector<prewarm_place> prewarm_placed;
-    /// 是否已读入且尚未被阶段切换消费。consumed 时置回 false（一次性），
-    /// park（每轮结束）也会清掉 —— 下一轮必须重新 prewarm_experts()。
+    /// Whether the data has been loaded and not yet consumed by a phase switch. Set to false when consumed (one-shot),
+    /// and also cleared by park() at the end of each round — prewarm_experts() must be called again next round.
     bool prewarm_ready = false;
 
     void prewarm_init() {
@@ -1985,7 +1985,7 @@ struct llama_moe_slot_runtime::impl {
         }
         FILE * fp = std::fopen(path, "r");
         if (!fp) {
-            moe_log("prewarm: 打不开表文件 %s", path);
+            moe_log("prewarm: cannot open table file %s", path);
             return;
         }
         prewarm_table.assign(layers.size(), {});
@@ -1998,7 +1998,7 @@ struct llama_moe_slot_runtime::impl {
                 ++p;
             }
             if (*p == '#' || *p == '\n' || *p == '\r' || *p == '\0') {
-                continue;   // 注释 / 空行不占层号
+                continue;   // Comments and blank lines do not count as layers
             }
             std::vector<int32_t> ids;
             while (*p) {
@@ -2025,10 +2025,10 @@ struct llama_moe_slot_runtime::impl {
         }
         std::fclose(fp);
         prewarm_enabled = total > 0 && decode_window > 0;
-        moe_log("prewarm: 表 %s -> %d 层 / %d 个专家, decode_window=%d, enabled=%s",
+        moe_log("prewarm: table %s -> %d layers / %d experts, decode_window=%d, enabled=%s",
                 path, li, total, (int) decode_window, prewarm_enabled ? "on" : "off");
         if (decode_window <= 0) {
-            moe_log("prewarm: 窗口未开（LLAMA_MOE_DECODE_WINDOW=0），预热不会生效");
+            moe_log("prewarm: window is disabled (LLAMA_MOE_DECODE_WINDOW=0); prewarming will have no effect");
         }
     }
 
@@ -2039,12 +2039,12 @@ struct llama_moe_slot_runtime::impl {
         }
         sweep_fp = fopen(path, "w");
         if (!sweep_fp) {
-            moe_log("sweep: 无法打开 %s", path);
+            moe_log("sweep: cannot open %s", path);
             return;
         }
         sweep_pred.assign(layers.size(), {});
         fprintf(sweep_fp, "# layer real_experts | predicted_experts(desc)\n");
-        moe_log("sweep: 记录到 %s（每 decode 步每层一行）", path);
+        moe_log("sweep: recording to %s (one line per layer per decode step)", path);
     }
 
     void sweep_write(int layer, const std::vector<int32_t> & used, const std::vector<int32_t> & pred) {
@@ -2062,12 +2062,12 @@ struct llama_moe_slot_runtime::impl {
         fprintf(sweep_fp, "\n");
     }
 
-    /// prefill 时记录**最后一个 token** 用的专家（`P<layer> E:...`）。
+    /// During prefill, record experts used by the **final token** (`P<layer> E:...`).
     ///
-    /// 用途：验证「prefill 能否给 decode 留一份初始缓存」。
-    /// prefill 每层要用 100+ 个专家，装不进按层窗口（c=24），所以 prefill 必须用
-    /// 整块 bank、逐层清空 —— 结束时 bank 里只剩最后一层的数据。但**最后一个 token
-    /// 用的 8 个专家是 decode 第一步最可能的邻居**，可以单独留下来当种子。
+    /// Purpose: verify whether prefill can leave an initial cache for decode.
+    /// Prefill uses 100+ experts per layer, too many for the per-layer window (c=24), so it must use
+    /// the full bank and clear it per layer. At the end, only the last layer's data remains in the bank. But the 8 experts used by the
+    /// final token are the most likely neighbors of decode's first step, so they can be retained as seeds.
     void sweep_write_prefill(int layer, const int32_t * ids, int n_ids, int n_tokens) {
         if (!sweep_fp || n_tokens <= 0) {
             return;
@@ -2113,7 +2113,7 @@ struct llama_moe_slot_runtime::impl {
         if (parked.load(std::memory_order_relaxed)) {
             return;
         }
-        // 一轮结束：窗口数据随本轮 decode churn 过，落位记录作废。
+        // End of a round: window contents have churned during decode, so the placement records are invalid.
         prewarm_ready = false;
         prewarm_placed.clear();
         int n_ok = 0;
@@ -2163,8 +2163,8 @@ void llama_moe_slot_runtime::map_custom(
         return;
     }
     auto * data = static_cast<llama_moe_slot_runtime::impl::map_userdata *>(userdata);
-    // 这里在**图执行期间**被调用（CPU 自定义 op），所以这段耗时直接落在关键路径上。
-    // 每层一次、每 token 40 次，量出来才能知道它是不是瓶颈。
+    // This runs during graph execution (CPU custom op), so its runtime is directly on the critical path.
+    // It runs once per layer, 40 times per token; measuring it reveals whether it is a bottleneck.
     const int64_t t0 = now_ns();
     data->runtime->process(data->layer, src, dst);
     data->runtime->add_process_ns(now_ns() - t0);
@@ -2204,9 +2204,9 @@ int llama_moe_slot_runtime::matmul_split() const {
     return pimpl->matmul_split;
 }
 
-/// A2 的 phase B 节点：把 slot_ids 拷一份作为输出（这样本节点自然依赖 phase A），
-/// 同时依赖前段专家的 matmul 输出 `b` —— 于是调度器会把它排在前段算完之后、
-/// 后段 matmul 之前执行。
+/// A2 phase B node: copy slot_ids to an output (so this node naturally depends on phase A),
+/// and also depend on the preceding experts' matmul output `b`, causing the scheduler to place it after the preceding section finishes
+/// and before the following matmul.
 void llama_moe_slot_runtime::map_custom_deferred(
         ggml_tensor * dst, const ggml_tensor * a, const ggml_tensor * b,
         int ith, int nth, void * userdata) {
@@ -2319,20 +2319,20 @@ void llama_moe_slot_runtime::process(
     const int32_t n_rows = (int32_t) expert_ids->ne[1];
 
     const bool decode = n_rows == 1;
-    // 窗口也覆盖投机验证这类**小批次**（批宽 = n_max+1）：它们与单 token decode 走
-    // 同一条 mul_mv_id 路径、同一套每层 `.dec` 张量，跨轮复用同一批专家。
-    // 大批次（prefill）不走 —— 它拿的是 prefill 共享视图，只能用 [0, prefill_cap) 那段。
+    // The window also covers small batches such as speculative verification (batch width = n_max+1): they use
+    // the same mul_mv_id path and per-layer `.dec` tensors as single-token decode, reusing the same experts across rounds.
+    // Large batches (prefill) do not use it — they use the shared prefill view and can only use [0, prefill_cap).
     //
-    // 上限由 window_max_rows 按缓存区容量夹紧（见 resolve_decode_window），
-    // 「并集装不下」的风险在那里就被消掉，不会落到这里的运行期。
+    // The upper bound is clamped by window_max_rows according to cache capacity (see resolve_decode_window),
+    // eliminating the risk that the union will not fit at runtime.
     const bool window_mode = pimpl->decode_window > 0 && n_rows <= pimpl->window_max_rows;
     const bool lookahead_step = pimpl->lookahead.enabled && decode;
 
-    // auto 模式下按阶段切 experts 的缓存策略：prefill 绕过、decode 不绕过。
+    // In auto mode, choose the expert-cache policy by phase: bypass during prefill, do not bypass during decode.
     //
-    // 判据用批宽而不是 window_mode —— 后者还要求 decode 窗口开着，而窗口关掉时
-    // decode 阶段照样存在，用它会连 decode 一起绕过缓存。本判据与 llama-context 的
-    // moe_decode_phase 同源。默认（非 auto）下这段不生效。
+    // Use batch width as the criterion rather than window_mode — the latter also requires the decode window to be enabled. When the window is off,
+    // decode still exists, so using window_mode would bypass the cache during decode too. This criterion shares its source with llama-context's
+    // moe_decode_phase. This code has no effect unless auto mode is enabled (the default is not auto).
     if (llama_moe_slot_runtime::impl::nocache_mode() < 0) {
         const bool want = n_rows > pimpl->window_max_rows;
         if (pimpl->want_nocache.load(std::memory_order_relaxed) != want) {
@@ -2341,58 +2341,58 @@ void llama_moe_slot_runtime::process(
         }
     }
 
-    // **只在窗口模式下**需要在加锁之前等预读收工。
+    // Only window mode needs to wait for prefetch to finish before acquiring the lock.
     //
-    // 窗口模式里预读 worker 会锁**目标层**的 mutex 去写它的窗口；若本函数已持
-    // state.mutex 再等 worker，就成了锁序反转 → 死锁（实际踩到过）。
-    // 非窗口模式 worker 只写尾部乒乓区、不碰任何层锁，所以照旧在锁后 take 取结果。
+    // In window mode, the prefetch worker locks the target layer mutex to write into its window. If this function already holds
+    // state.mutex while waiting for the worker, lock order is reversed and a deadlock occurs (this has happened in practice).
+    // In non-window mode, the worker writes only to the trailing ping-pong buffer and touches no layer lock, so take() remains after the lock as before.
     if (lookahead_step && window_mode) {
-        std::vector<lookahead_expert_prefetch::hit> ignored;   // 窗口模式不返回 hit
+        std::vector<lookahead_expert_prefetch::hit> ignored;   // Window mode does not return hits
         pimpl->lookahead.take(layer, ignored);
     }
 
     std::lock_guard<std::mutex> lock(state.mutex);
 
-    // 阶段切换：prefill 用的是整块 bank / prefill 共享视图，与每层窗口在物理上可能
-    // 落在同一块内存，所以**进入窗口阶段时**必须把每层的映射整表清空。
+    // On phase switch, prefill uses the full bank / shared prefill view, which may physically overlap per-layer windows,
+    // so all per-layer mappings must be cleared when entering window mode.
     //
-    // 只清窗口内那 W 个 slot 是不够的：prefill 留下的 `expert_to_slot` 里还有大量
-    // 指向**窗口之外**的陈旧映射，那些专家会被 process() 误判成「已在内存」而跳过安装，
-    // 于是 matmul 读到的是别的专家权重 —— 输出错但不报错。（这是实际踩到的 bug。）
+    // Clearing only the W slots inside the window is insufficient: prefill leaves many stale expert_to_slot mappings
+    // pointing outside the window. process() then wrongly treats those experts as resident and skips loading them,
+    // so matmul reads another expert's weights — incorrect output without an error. (This bug occurred in practice.)
     if (window_mode && !pimpl->was_window) {
         for (auto & st : pimpl->layers) {
             if (!st.enabled) {
                 continue;
             }
-            // 当前层（layer 0）的 mutex 已经被上面那个 lock_guard 持有了，
-            // 再锁一次会**自死锁**（std::mutex 不可重入）。它由下面那段直接清。
+            // The mutex for the current layer (layer 0) is already held by the lock_guard above;
+            // locking it again would self-deadlock (std::mutex is not recursive). The mapping is cleared directly below.
             if (&st == &state) {
                 continue;
             }
             std::lock_guard<std::mutex> lk(st.mutex);
             llama_moe_slot_runtime::impl::clear_layer_cache(st);
         }
-        // 当前层自己在锁内清（不用再锁）
+        // Clear the current layer while its lock is held (do not lock it again).
         llama_moe_slot_runtime::impl::clear_layer_cache(state);
 
-        // 缓存预热：窗口刚开、缓存刚清空（每轮生成都会走到这里一次）。
+        // Cache prewarming: the window has just opened and the cache has just been cleared (once per generation round).
         //
-        // 若这轮已经在 prefill 之前调过 `prewarm_experts()`（App 的正常路径），
-        // 那批专家**已经读进窗口**且 prefill 碰不到它（decode 段与 prefill 段物理分离），
-        // 这里只需**重新发布映射**（纯整数操作、零 I/O）；否则退回「现在读」的老路径。
-        // 此刻 layer 0 的锁已被本函数持有，两个函数对当前层都不再加锁。
+        // If prewarm_experts() was already called before prefill this round (the app's normal path),
+        // those experts have already been read into the window, and prefill cannot touch them (decode and prefill regions are physically separate).
+        // Only republish the mappings here (integer operations only, zero I/O); otherwise fall back to the old path that reads them now.
+        // The current layer 0 lock is already held, so neither function locks the current layer again.
         if (pimpl->prewarm_ready) {
             const size_t n_before = pimpl->prewarm_placed.size();
             pimpl->publish_prewarm_placed(layer);
-            pimpl->prewarm_ready = false;   // 一次性：本轮已消费
-            moe_log("prewarm: 重挂 %zu 个已预热专家（无 I/O，数据活过 prefill）", n_before);
+            pimpl->prewarm_ready = false;   // One-shot: consumed for this round
+            moe_log("prewarm: republished %zu prewarmed experts (no I/O; data survived prefill)", n_before);
         } else {
             pimpl->prewarm_windows(layer);
         }
     }
-    // 阶段判据必须是 `window_mode` 而不是 `decode`：投机验证（批宽 = n_max+1）与
-    // 单 token decode 属于**同一个阶段**，它们之间不能清缓存 —— 否则窗口每步都被
-    // 清空，跨轮复用无从谈起（实测那样会让窗口命中率归零）。
+    // The phase criterion must be window_mode, not decode: speculative verification (batch width = n_max+1) and
+    // single-token decode are the **same phase** and must not clear the cache between them — otherwise the window
+    // is cleared every step and cross-round reuse becomes impossible (measured hit rate dropped to zero).
     pimpl->was_window = window_mode;
 
     if (pimpl->shared_bank && !window_mode) {
@@ -2408,8 +2408,8 @@ void llama_moe_slot_runtime::process(
     std::vector<int32_t> slots(count);
     std::vector<uint8_t> requested(pimpl->n_expert, 0);
 
-    // 诊断：这个 token 里哪些**位置**会 miss（该位置还不在缓存里）。
-    // 注意此时槽位分配还没做，所以只用 expert_to_slot 判断「已驻留」。
+    // Diagnostic: identify which positions in this token will miss (the expert is not cached yet).
+    // Slot allocation has not happened yet, so use expert_to_slot only to test residency.
     if (window_mode && expert_ids->ne[1] == 1) {
         pimpl->miss_pos_steps++;
         for (size_t i = 0; i < count && i < 16; ++i) {
@@ -2430,8 +2430,8 @@ void llama_moe_slot_runtime::process(
     if (pimpl->lookahead.enabled && !decode) {
         pimpl->lookahead.reset();
     }
-    // 非窗口模式：在这里取预读结果（命中已在乒乓区，需搬到目标 slot）。
-    // 窗口模式的结果由 worker 直接写进目标窗口了，这里无事可做。
+    // Non-window mode: take prefetch results here (hits are in the ping-pong region and must be moved to target slots).
+    // In window mode, the worker has already written results directly into the target window, so nothing is needed here.
     if (lookahead_step && !window_mode) {
         std::vector<lookahead_expert_prefetch::hit> hits;
         pimpl->lookahead.take(layer, hits);
@@ -2449,17 +2449,17 @@ void llama_moe_slot_runtime::process(
         }
     }
 
-    // 分配范围。窗口模式下只在**本层窗口**内找空位 / 淘汰 —— 这是整个机制的要点：
-    // 每层有独立的 slot 段，所以层间的 LRU 互不干扰，缓存能跨 token 存活。
-    // 非窗口模式仍是整块 bank（预读开启时让出尾部乒乓区）。
+    // Allocation range. In window mode, find free slots/evictions only within this layer's window — this is the key idea:
+    // each layer has its own slot range, so LRU is independent across layers and cached entries survive across tokens.
+    // Non-window mode still uses the whole bank (reserving the trailing ping-pong region when prefetch is enabled).
     int32_t alloc_lo = 0;
     int32_t alloc_hi = pimpl->n_slots;
     if (window_mode) {
         alloc_lo = state.window_start;
-        // 分区模式：主路径只从缓存区分配，暂存区留给预读（互不挤占）。
-        // 统一模式：主路径也可用整个窗口 —— 用到的专家因此天然进入跨 token LRU，
-        // 不会被「预读区每步重填」冲掉。
-        // 边界用**本层宽度**（各层不同，见 layer_state::window_width）。
+        // Partitioned mode: the main path allocates only from the cache region, leaving staging slots for prefetch (no competition).
+        // Unified mode: the main path may use the whole window, so used experts naturally enter the cross-token LRU
+        // and are not flushed when the prefetch region is refilled every step.
+        // Use this layer's width for boundaries (widths vary by layer; see layer_state::window_width).
         const int32_t w_il = state.window_width > 0
             ? state.window_width : (pimpl->decode_window + pimpl->prefetch_slots);
         alloc_hi = state.window_start + w_il -
@@ -2468,11 +2468,11 @@ void llama_moe_slot_runtime::process(
         alloc_hi = pimpl->lookahead.slot_floor();
     }
 
-    // 「缓存 + 预测」的结合点（零 I/O 成本）：
-    // 上一层给出的预测里，有些专家本层这次没用到、但**下一步**会用。淘汰时必须
-    // 避开它们 —— 否则「刚被预测会用」的条目恰好是最老的，正好被换出去。
+    // The point where cache and prediction combine (zero I/O cost):
+    // Some experts predicted by the previous layer are not used in this layer now, but will be used next step. Eviction must
+    // avoid them — otherwise the oldest entry might be one just predicted to be used and would be evicted.
     //
-    // 这不是预读（不读任何字节），只是把已有的预测信号用来改进淘汰决策。
+    // This is not prefetch (no bytes are read); it uses existing prediction signals to improve eviction decisions.
     std::vector<uint8_t> keep;
     if (window_mode && pimpl->lookahead.enabled) {
         std::vector<int32_t> pred;
@@ -2496,19 +2496,19 @@ void llama_moe_slot_runtime::process(
     std::vector<llama_moe_slot_runtime::impl::pending_install> pending;
     pending.reserve((size_t) std::min((int32_t) pimpl->n_slots, pimpl->n_expert));
 
-    // A2：按**名次**决定「现在读」还是「延后读」。末尾 matmul_split 个**名次**的
-    // 缺失专家延后到 phase B —— 实测 miss 高度集中在尾部（名次 7 的 miss 是名次 0
-    // 的 7 倍），那里最可能真的有东西要读。
+    // A2: use **rank** to decide whether to read now or defer. Missing experts among the last matmul_split ranks
+    // are deferred to phase B — measurements show misses are concentrated near the end (rank 7 has 7 times
+    // as many misses as rank 0), where an actual read is most likely to be needed.
     //
-    // 按**固定名次**切而不是按「是否驻留」排序切，是为了保持求和顺序不变 ——
-    // 输出因此可以逐字节校验。
+    // Split by **fixed rank** rather than sorting by residency, to preserve summation order —
+    // this allows byte-for-byte output verification.
     //
-    // 判据必须用**名次**（`pos % n_used`）而不是线性下标：展平顺序是
-    // `pos = 名次 + n_used * 行号`（ne[0] 变化最快，见 read_i32_ids），所以
-    // 「末尾 K 个线性下标」多行时只覆盖最后 K/n_used 行的**全部**名次；而图侧的切分
-    // （build_moe_ffn 的 slice_ids）切的是**所有行**的名次 [split_at, n_used)。
-    // 两边对不上，phase A 就会读到 phase B 还没写入的槽位（静默读错专家权重）。
-    // 单 token 时 pos == 名次，两种写法等价。
+    // The criterion must use rank (pos % n_used), not the linear index: the flattened order is
+    // pos = rank + n_used * row (ne[0] changes fastest; see read_i32_ids), so
+    // "the last K linear indices" across multiple rows would cover all ranks only in the last K/n_used rows, whereas the graph split
+    // (slice_ids in build_moe_ffn) splits ranks [split_at, n_used) across all rows.
+    // If the two do not match, phase A may read a slot before phase B has written it (silently using incorrect expert weights).
+    // For a single token, pos == rank, so both approaches are equivalent.
     auto & defer_list = pimpl->deferred[(size_t) layer];
     defer_list.clear();
     const int32_t n_used_row = (int32_t) expert_ids->ne[0];
@@ -2518,7 +2518,7 @@ void llama_moe_slot_runtime::process(
     for (size_t pos = 0; pos < count; ++pos) {
         const int32_t expert = experts[pos];
         if (state.expert_to_slot[expert] >= 0) {
-            slots[pos] = state.expert_to_slot[expert];   // 已驻留，无需读取
+            slots[pos] = state.expert_to_slot[expert];   // Already resident; no read needed
             continue;
         }
 
@@ -2530,11 +2530,11 @@ void llama_moe_slot_runtime::process(
             }
         }
         if (slot < 0) {
-            // 淘汰时跳过 kSlotPending：那是预读 worker 正在写的 slot，
-            // 动它会让 worker 把内容写到一个已经属于别人的位置。
+            // Skip kSlotPending during eviction: the prefetch worker is currently writing that slot;
+            // evicting it would make the worker write into a slot that already belongs to someone else.
             //
-            // 两轮挑选：第一轮只考虑「预测下一步不会用」的条目（keep[]==0），
-            // 第二轮才放宽。这样预测会用的条目能多留一步 —— 零 I/O 成本的收益。
+            // Two-pass selection: pass 0 considers only entries not predicted to be used next step (keep[] == 0);
+            // pass 1 relaxes this constraint. This lets predicted entries survive one more step at zero I/O cost.
             for (int pass = 0; pass < 2 && slot < 0; ++pass) {
                 uint64_t oldest = UINT64_MAX;
                 for (int32_t candidate = alloc_lo; candidate < alloc_hi; ++candidate) {
@@ -2543,7 +2543,7 @@ void llama_moe_slot_runtime::process(
                         continue;
                     }
                     if (pass == 0 && !keep.empty() && keep[(size_t) resident]) {
-                        continue;   // 预测下一步要用，先不动它
+                        continue;   // Predicted to be used next step; leave it alone for now
                     }
                     if (!requested[resident] && state.slot_age[candidate] < oldest) {
                         oldest = state.slot_age[candidate];
@@ -2554,8 +2554,8 @@ void llama_moe_slot_runtime::process(
                     if (slot >= 0) {
                         pimpl->lookahead.n_evict_saved.fetch_add(1, std::memory_order_relaxed);
                     } else {
-                        // pass0 一个都没找到 —— 说明候选**全在预测集里**，
-                        // 也就是「保护预测条目」这个策略真的起了约束作用。
+                        // No candidates were found in pass 0 — all candidates are in the prediction set,
+                        // meaning the "protect predicted entries" policy is genuinely constraining eviction.
                         pimpl->lookahead.n_evict_forced.fetch_add(1, std::memory_order_relaxed);
                     }
                 }
@@ -2576,7 +2576,7 @@ void llama_moe_slot_runtime::process(
         const bool defer_this = defer_by_rank &&
             (int32_t) (pos % (size_t) n_used_row) >= split_at;
         if (defer_this) {
-            // 延后：槽位标 kSlotPending 占住（别处不会动它），phase B 读完再发布。
+            // Defer: mark the slot kSlotPending to reserve it (so nothing else touches it); phase B reads and publishes it later.
             state.slot_to_expert[slot] = kSlotPending;
             defer_list.push_back({ expert, slot });
         } else {
@@ -2599,7 +2599,7 @@ void llama_moe_slot_runtime::process(
     pimpl->install_ns.fetch_add(timing.wall_ns, std::memory_order_relaxed);
 
     if (!pending.empty()) {
-        // 仅统计，不影响读取路径。按层取增量，避免 cur 累计后重复计数。
+        // Statistics only; does not affect the read path. Use per-layer deltas to avoid double-counting cumulative cur values.
         const auto st = llama_moe_slot_runtime::impl::accumulate_runs(pending);
         llama_moe_slot_runtime::impl::add_runs(pimpl->cur.runs, st);
         llama_moe_slot_runtime::impl::add_runs(pimpl->g_runs, st);
@@ -2608,18 +2608,18 @@ void llama_moe_slot_runtime::process(
     if (lookahead_step && lookahead_pred) {
         std::vector<int32_t> pred;
         pimpl->read_i32_ids(lookahead_pred, pred);
-        // 「缓存 + 预测」的结合点（零 I/O）：把预测留给**目标层**，
-        // 它下一步淘汰时可以避开这些条目。不是预读 —— 不读任何字节。
+        // Cache + prediction integration point (zero I/O): retain predictions for the target layer,
+        // so its next eviction can avoid those entries. This is not prefetch — no bytes are read.
         {
             std::lock_guard<std::mutex> lk(pimpl->pred_mtx);
             pimpl->predicted[(size_t) layer + 1] = pred;
         }
-        // arm 前先去掉**目标层缓存里已有**的预测专家。
+        // Before arm(), remove predicted experts that are already in the target layer cache.
         //
-        // 它们本来就不需要读（worker 也会查表跳过），但会让 arm 的批次看起来更大、
-        // worker 跑得更久 —— 而 arm 在 worker 忙时是**直接丢弃**的（pfskip）。
-        // 实测每 token 约 9 次 arm 因此被丢（40 次里的 22%），等于白扔预测。
-        // 先过滤就只把「真需要读的」交给 worker，批次更小、完成更快、丢得更少。
+        // They do not need to be read (the worker also skips them after checking the map), but they make the arm batch appear larger
+        // and keep the worker busy longer — and arm() is discarded immediately (pfskip) while the worker is busy.
+        // Measurements showed about 9 arm calls per token were discarded this way (22% of 40), wasting predictions.
+        // Filtering first sends only experts that really need reading to the worker, making batches smaller, faster, and less likely to be dropped.
         std::vector<int32_t> need_read;
         need_read.reserve(pred.size());
         {
@@ -2636,16 +2636,16 @@ void llama_moe_slot_runtime::process(
         if (!need_read.empty()) {
             pimpl->lookahead.arm(layer + 1, need_read);
         }
-        // 记下「给层 layer+1 的预测」，供 layer+1 的扫描记录用。
-        // 注意预测本身是用层 layer 的 hidden 算的（见 qwen35moe.cpp），所以
-        // 层 0 永远拿不到预测 —— 预读覆盖率的结构性上界是 39/40。
+        // Record predictions for layer+1 for use in that layer's sweep record.
+        // Predictions are computed from this layer's hidden state (see qwen35moe.cpp), so
+        // layer 0 never receives predictions — the structural upper bound for prefetch coverage is 39/40.
         if (pimpl->sweep_fp && layer + 1 < (int) pimpl->sweep_pred.size()) {
             pimpl->sweep_pred[layer + 1] = pred;
         }
     }
 
-    // 命中率扫描：decode 记录整批的 E（真实用到）；prefill 只记**最后一个 token** 的 E
-    // （用于判断 prefill 能否给 decode 留初始缓存）。
+    // Hit-rate sweep: during decode, record all E experts actually used; during prefill, record only E for the final token
+    // (to test whether prefill can leave an initial cache for decode).
     if (pimpl->sweep_fp) {
         if (decode) {
             std::vector<int32_t> used;
@@ -2674,7 +2674,7 @@ void llama_moe_slot_runtime::process(
         }
         if (n_tokens <= 1) {
             pimpl->n_decode_step++;
-            pimpl->miss_per_layer_steps++;   // 每 decode 步一次（不是每层）
+            pimpl->miss_per_layer_steps++;   // Once per decode step (not once per layer)
         } else {
             pimpl->n_prefill_ubatch++;
         }
@@ -2722,15 +2722,15 @@ void llama_moe_slot_runtime::process(
         }
     }
 
-    // slots[] 已在分配循环里按位置填好（被延后的也有有效槽位地址）。这里只补
-    // LRU 时间戳：位置越靠后越新，与原来一致。
+    // slots[] has already been filled by position in the allocation loop (deferred entries also have valid slot addresses). Here, only update
+    // LRU timestamps: later positions are newer, as before.
     for (size_t i = 0; i < count; ++i) {
         if (slots[i] < 0) {
             throw std::runtime_error("MoE expert was not installed");
         }
         state.slot_age[(size_t) slots[i]] = ++state.age;
-        // 诊断：这个专家来自预读区吗？预读区每步重填，所以它**用完就没了** ——
-        // 下次再需要就得重读。理想情况应该把它升格到缓存区。
+        // Diagnostic: did this expert come from the prefetch region? That region is refilled every step, so the entry disappears after use —
+        // if needed again, it must be reread. Ideally, it should be promoted to the cache region.
         if (window_mode && pimpl->prefetch_slots > 0 &&
             slots[i] >= state.window_start + (state.window_width > 0
                         ? state.window_width - pimpl->prefetch_slots : pimpl->decode_window)) {
@@ -2744,13 +2744,13 @@ void llama_moe_slot_runtime::process(
     }
 }
 
-/// A2 的 phase B：把 phase A 里被延后的缺失专家读进来，并发布到窗口。
+/// A2 phase B: read missing experts deferred during phase A, then publish them into the window.
 ///
-/// 调用时机：**在「前段专家（位置 < n - matmul_split）已经算完」之后**。
-/// 那时 GPU 正在算那些已驻留的专家，这里的读就与它重叠了 —— 这是整个 A2 的收益来源。
+/// Called after the earlier experts (positions < n - matmul_split) have finished computing.
+/// The GPU is then computing those resident experts while these reads happen concurrently — this is the source of A2's benefit.
 ///
-/// 锁：读盘不持锁（槽位在 phase A 已标 kSlotPending，别处不会动它）；只有发布
-/// （写 expert_to_slot / slot_to_expert）才持层锁，和预读 worker 的写法一致。
+/// Locking: disk reads do not hold a lock (the slots were marked kSlotPending in phase A and cannot be touched elsewhere); only publishing
+/// (writing expert_to_slot / slot_to_expert) takes the layer lock, matching the prefetch worker's approach.
 void llama_moe_slot_runtime::process_deferred(int layer) {
     if (layer < 0 || layer >= (int) pimpl->deferred.size()) {
         return;
