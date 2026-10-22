@@ -1,606 +1,612 @@
 # llama.cpp-omni
 
-**llama.cpp-omni** is a high-performance Omni multimodal inference engine built on [llama.cpp](https://github.com/ggml-org/llama.cpp).
+This is a fork of https://github.com/OpenBMB/llama.cpp-omni intended to make it compile and work on Linux using
+the CPU backend to stream the [openbmb/MiniCPM-V-4.7-35B-A3B](https://huggingface.co/openbmb/MiniCPM-V-4.7-35B-A3B)
+model from an SSD drive via [LES: Lookahead Expert Scheduling](docs/les/lookahead-expert-scheduling.md)
+even on computers with no usable GPU and only 8 GiB of RAM.
 
-- 🚀 **First Full-Duplex Omni Streaming Engine** — The first open-source C++ inference framework supporting full-duplex, omni-modal streaming video calls
-- ⚡ **Lightweight & Efficient** — Inherits llama.cpp's high-performance characteristics with GGUF quantization support and low memory footprint
-- 🔌 **Fully Ecosystem Compatible** — Compatible with llama.cpp interfaces and ecosystem for seamless integration with existing toolchains
-- 🌐 **Cross-Platform Deployment** — Supports Windows, Linux, and macOS, enabling efficient Omni model inference on consumer-grade hardware
-- 🎙️ **End-to-End Voice Interaction** — Supports the complete pipeline of streaming audio input, LLM inference, and TTS speech synthesis
+## Build instructions
 
----
+```sh
+cmake -B build \
+  -DGGML_NATIVE=ON \
+  -DBUILD_SHARED_LIBS=OFF \
+  -DCMAKE_BUILD_TYPE=Release
 
-## MiniCPM-o
-
-[**MiniCPM-o 4.5**](https://github.com/OpenBMB/MiniCPM-o) is a 9B-parameter on-device omni-modal large language model jointly developed by ModelBest and Tsinghua University, featuring powerful vision, speech, and full-duplex streaming capabilities.
-
----
-
-## Omni Architecture & Runtime Mechanism
-
-### Model Architecture
-
-Built on the MiniCPM-o 4.5 end-to-end omni-modal architecture, where modality encoders/decoders are densely connected to the LLM through hidden states. This design enables better information flow and control while fully leveraging the rich multimodal knowledge acquired during training.
-
-llama.cpp-omni splits the original PyTorch model into multiple independent GGUF modules, each with specific responsibilities:
-
-- **VPM**: Vision encoder based on SigLip2 architecture, responsible for encoding images into visual embeddings. Includes a Resampler module that compresses visual features into a fixed number of query tokens before projecting them into the LLM's hidden space.
-- **APM**: Audio encoder based on Whisper architecture, responsible for encoding 16kHz audio into audio embeddings. Features AvgPool and Projector layers to project into the LLM's hidden space.
-- **LLM**: Main language model based on Qwen3-8B, which receives visual and audio embeddings as input and generates text token sequences. Supports multiple quantization formats (F16/Q8_0/Q4_K_M).
-- **TTS**: Text-to-speech model based on LLaMA architecture, which projects LLM hidden states through Projector Semantic and autoregressively generates audio token sequences.
-- **Token2Wav**: Flow Matching-based vocoder that converts audio tokens into 24kHz waveform audio.
-
-### Full-Duplex Streaming Mechanism
-
-llama.cpp-omni implements a full-duplex streaming mechanism where input streams (video + audio) and output streams (speech + text) operate without blocking each other:
-
-- **Streaming Encoders**: Transforms offline modality encoders into online streaming versions for real-time input processing. Audio is sliced into 1-second chunks for APM, while images are fed frame-by-frame to VPM.
-- **Time-Division Multiplexing (TDM)**: Within the LLM backbone, TDM divides parallel omni-modal streams into sequential information groups within periodic time slices, achieving millisecond-level input/output stream synchronization.
-- **Interleaved Speech Generation**: The TTS module models text and speech tokens in an interleaved manner, supporting full-duplex speech generation where output can synchronize with new input in real-time while ensuring stability for long speech generation (>1 minute).
-
-### Proactive Interaction Mechanism
-
-In duplex mode, the LLM continuously monitors incoming video and audio streams, deciding whether to speak proactively at 1Hz frequency. This high-frequency decision-making capability, combined with full-duplex features, enables proactive interactions such as spontaneous reminders and comments.
-
-### Runtime Pipeline
-
-The core runtime pipeline of llama.cpp-omni consists of three stages:
-
-1. **Initialization (omni_init)**: Loads all GGUF models, initializes LLM/TTS/Token2Wav contexts, and configures simplex/duplex mode along with reference audio (for voice cloning).
-
-2. **Streaming Prefill (stream_prefill)**: 
-   - When `index=0`: Initializes System Prompt, including text system prompt and audio system prompt (reference audio embedding)
-   - When `index>0`: Processes user input — audio is encoded via APM, images via VPM, and embeddings are fed into LLM prefill
-   - Supports high-resolution mode (max_slice_nums=2) and high-FPS mode (main image + stacked images)
-
-3. **Streaming Decode (stream_decode)**:
-   - LLM autoregressively generates text tokens, entering speech generation upon `<|speak|>` and switching to listening state upon `<|listen|>`
-   - TTS projects LLM hidden states to generate audio tokens
-   - Token2Wav synthesizes WAV audio in real-time using a sliding window approach (28 tokens input, 25 tokens stride)
-   - All three modules execute in parallel via asynchronous queues, enabling streaming output
-
----
-
-## Performance Benchmarks
-
-### Inference Latency (RTX 4090, F16)
-
-| Stage | Latency | Notes |
-|-------|---------|-------|
-| **Time to First Token (TTFT)** | **< 550ms** | First audio output |
-| Prefill (vision + audio) | ~65ms | Audio-only ~21ms |
-| Decode-LLM | ~38ms/token | 3 tokens ~115ms |
-| TTS Generation | ~8.5ms/token | 25 tokens ~215ms |
-| Token2Wav | RTF ~0.15x | 25 tokens → 1s audio ~150ms |
-
-### Inference Latency (Apple M4 Max, Metal)
-
-| Stage | Latency | Notes |
-|-------|---------|-------|
-| **Time to First Token (TTFT)** | **< 650ms** | First audio output |
-| Prefill (audio) | ~30ms | Audio-only |
-| Decode-LLM | ~12ms/token | Metal accelerated |
-| TTS Generation | ~10ms/token | Metal accelerated |
-| Token2Wav (Token2Mel) | ~235ms/chunk | Metal accelerated |
-| Token2Wav (Vocoder) | ~220ms/chunk | CPU (HiFiGAN) |
-| **Token2Wav Total** | RTF ~0.47x | 28 tokens → 1s audio ~450ms |
-
-### Memory Usage (NVIDIA GPU)
-
-| Configuration | LLM Quantization | Model Size | VRAM Estimate |
-|---------------|------------------|------------|---------------|
-| Full Omni | F16 | ~18 GB | ~20 GB |
-| Full Omni | Q8_0 | ~11 GB | ~13 GB |
-| Full Omni | Q4_K_M | ~8 GB | ~9 GB |
-| Vision Only | Q8_0 | ~9 GB | ~10 GB |
-| Audio Only | Q8_0 | ~10 GB | ~12 GB |
-
-### Memory Usage (Apple Silicon)
-
-| Configuration | LLM Quantization | Model Size | Unified Memory |
-|---------------|------------------|------------|----------------|
-| Full Omni | F16 | ~15 GB | ~19 GB |
-| Full Omni | Q8_0 | ~8.1 GB | ~12 GB |
-| Full Omni | Q4_K_M | ~4.7 GB | ~8.5 GB |
-
-> **Note**: Apple Silicon uses unified memory architecture. Recommended: 16GB Mac for Q4_K_M/Q8_0, 32GB+ Mac for F16.
-
-### On-device MoE Inference (LES)
-
-MiniCPM-V 4.7 35B-A3B runs on mobile devices with expert weights streamed from SSD. LES keeps
-decode speed usable without dropping experts. Decode speed as each optimization is added:
-
-| Device | Baseline | + LES | + mixed-precision quantization | + DSpark |
-|--------|---------:|------:|-------------------------------:|---------:|
-| iPhone 18 Pro Max (12 GB) | 3.38 token/s | 11.34 token/s | 17.16 token/s | **20.51 token/s** |
-| iPad Pro 11-inch M4 (16 GB) | 2.97 token/s | 9.81 token/s | 14.92 token/s | **17.39 token/s** |
-
-See [LES: Lookahead Expert Scheduling](docs/les/lookahead-expert-scheduling.md) for details.
-
----
-
-## Quick Start
-
-### Prerequisites
-
-**Model Files**: Download MiniCPM-o 4.5 GGUF models with the following directory structure:
-
-```
-MiniCPM-o-4_5-gguf/
-├── MiniCPM-o-4_5-Q4_K_M.gguf         # LLM (or F16/Q8_0)
-├── audio/
-│   └── MiniCPM-o-4_5-audio-F16.gguf
-├── tts/
-│   ├── MiniCPM-o-4_5-tts-F16.gguf
-│   └── MiniCPM-o-4_5-projector-F16.gguf
-├── token2wav-gguf/
-│   ├── encoder.gguf                  # ~144MB
-│   ├── flow_matching.gguf            # ~437MB
-│   ├── flow_extra.gguf               # ~13MB
-│   ├── hifigan2.gguf                 # ~79MB
-│   └── prompt_cache.gguf             # ~67MB
-└── vision/
-    └── MiniCPM-o-4_5-vision-F16.gguf
+cmake --build build --config Release -j$(nproc)
 ```
 
-### Build
+It produces the `build/bin/llama-cli` and `build/bin/llama-bench` binaries.
+
+## Preparing the compatible model data files
+
+Suppose that you have a model file, e.g. **MiniCPM-V-4.7-35B-A3B-AD-IQ2_XS-IQ2_XXS.gguf** from
+https://huggingface.co/AtomicChat/MiniCPM-V-4.7-35B-A3B-GGUF (it has to have `qwen35moe` architecture).
+Now execute the following scripts:
+
+```sh
+python3 tools/moe/experts.py extract --model MiniCPM-V-4.7-35B-A3B-AD-IQ2_XS-IQ2_XXS.gguf \
+                                     --out-dir MiniCPM-V-4.7-35B-A3B-AD-IQ2_XS-IQ2_XXS-les-experts
+
+python3 tools/moe/strip_experts.py --model MiniCPM-V-4.7-35B-A3B-AD-IQ2_XS-IQ2_XXS.gguf \
+                                   --out MiniCPM-V-4.7-35B-A3B-AD-IQ2_XS-IQ2_XXS-les.gguf \
+                                   --experts MiniCPM-V-4.7-35B-A3B-AD-IQ2_XS-IQ2_XXS-les-experts
+```
+
+The result is a small **MiniCPM-V-4.7-35B-A3B-AD-IQ2_XS-IQ2_XXS-les.gguf** model file (note the
+"-les" suffix) with the expert weights removed from it and a separate directory
+**MiniCPM-V-4.7-35B-A3B-AD-IQ2_XS-IQ2_XXS-les-experts**, where each expert is stored as a
+separate binary file.
+
+## Running
+
+Now a chat can be started as:
+
+```sh
+./build/bin/llama-cli \
+  -m MiniCPM-V-4.7-35B-A3B-AD-IQ2_XS-IQ2_XXS-les.gguf \
+  --moe-experts MiniCPM-V-4.7-35B-A3B-AD-IQ2_XS-IQ2_XXS-les-experts \
+  --moe-slot-bank 1024
+```
+
+## Tuning performance
+
+There are tons of environment variables that can be used to finetune performance. Below is the environment
+variables documentation, automatically generated by ChatGPT:
+
+### MoE-SSD Environment Variable Reference
+
+This document describes the environment variables used by the MoE-SSD expert-loading/runtime code in the supplied `llama-moe-slot.cpp` source snapshot from [OpenBMB/llama.cpp-omni](https://github.com/OpenBMB/llama.cpp-omni). It focuses on behavior implemented by that source file, including cache-window management, lookahead prefetch, file I/O, and diagnostics.
+
+> **Version note:** `llama.cpp-omni` evolves quickly. These settings are implementation details, not a stable cross-version API. Confirm them against the exact commit you build. In particular, the supplied runtime file delegates parsing of `LLAMA_MOE_DECODE_WINDOW` and `LLAMA_MOE_LAYER_WINDOWS` to the model-side implementation; the exact grammar for `LLAMA_MOE_LAYER_WINDOWS` is not defined in the supplied file and is intentionally not guessed here.
+
+#### Contents
+
+- [At a glance](#at-a-glance)
+- [Conceptual model](#conceptual-model)
+- [General parsing rules](#general-parsing-rules)
+- [Decode cache and window sizing](#decode-cache-and-window-sizing)
+- [Lookahead prefetch](#lookahead-prefetch)
+- [I/O concurrency and scheduling](#io-concurrency-and-scheduling)
+- [Page-cache policy](#page-cache-policy)
+- [Memory parking](#memory-parking)
+- [Diagnostics and controlled experiments](#diagnostics-and-controlled-experiments)
+- [Cache prewarming file format](#cache-prewarming-file-format)
+- [Configuration examples](#configuration-examples)
+- [Troubleshooting](#troubleshooting)
+- [Related non-environment setting](#related-non-environment-setting)
+- [Sources and scope](#sources-and-scope)
+
+#### At a glance
+
+The defaults below describe the supplied source snapshot, not necessarily every branch or future release.
+
+| Variable | Purpose | Default / unset behavior |
+|---|---|---|
+| `LLAMA_MOE_DECODE_WINDOW` | Enables/configures the per-layer decode cache window | The runtime does not enable the window when the variable is unset or empty. The model-side implementation determines the actual width. |
+| `LLAMA_MOE_LAYER_WINDOWS` | Requests different cache widths for different layers | Uniform per-layer widths when not configured. Exact value syntax is model-side and not specified in the supplied runtime file. |
+| `LLAMA_MOE_WINDOW_MAX_ROWS` | Maximum batch width eligible to use the decode window | `1`; the requested value may be clamped down to fit cache capacity. |
+| `LLAMA_MOE_LOOKAHEAD_PREFETCH` | Enables cross-layer lookahead prefetch | Off. |
+| `LLAMA_MOE_LOOKAHEAD_PREFETCH_DEPTH` | Number of predicted experts reserved for lookahead prefetch | `8` when lookahead is enabled; ignored unless the parent switch is enabled. Accepted integer range: `0`–`16`. |
+| `LLAMA_MOE_PREFETCH_READ` | Number of predicted experts actually read from storage | Follows the prefetch depth. `0` selects prediction-only behavior. |
+| `LLAMA_MOE_PREFETCH_UNIFIED` | Chooses a unified or partitioned cache/prefetch window | Unified mode on. Set to `0` for partitioned mode. |
+| `LLAMA_MOE_IO_THREADS` | Parallel I/O worker count used for an expert-read wave | `4`; valid values are `1`–`64`, otherwise falls back to `4`. |
+| `LLAMA_MOE_MATMUL_SPLIT` | Defers reads for the last selected-expert ranks so reads can overlap compute | `0` (disabled). Effective only in decode-window mode and for a split smaller than the selected-expert count. |
+| `LLAMA_MOE_F_NOCACHE` | Controls whether expert file reads bypass the OS page cache | Off (`0`). Also supports `auto`. |
+| `LLAMA_MOE_PARK_WINDOW` | Allows expert memory to be parked at a round boundary | On. Set to `0` to disable. |
+| `LLAMA_MOE_LOG_EVERY_STEP` | Emits MoE I/O statistics every step instead of sparse summaries | Off. |
+| `LLAMA_MOE_PREWARM` | Path to a file listing experts to load into the decode cache | Unset; no prewarm table is loaded. |
+| `LLAMA_MOE_SWEEP` | Path for raw routing/prediction traces | Unset; no sweep file is written. |
+| `LLAMA_MOE_DUMMY_READ` | Performs real reads into scratch memory instead of expert slots | Off. Diagnostic only; inference results are invalid. |
+| `LLAMA_MOE_SKIP_READ` | Skips the physical read while exercising part of the accounting path | Off. Diagnostic only; inference results are invalid. |
+| `LLAMA_MOE_READ_DELAY_US` | Adds an artificial delay before each physical read | `0` microseconds (no delay). |
+| `LLAMA_MOE_FATE`, `LLAMA_MOE_FATE_DEPTH` | Old names for the lookahead feature | Deprecated/ignored by this implementation. Use the `LLAMA_MOE_LOOKAHEAD_PREFETCH*` names instead. |
+
+#### Conceptual model
+
+MoE-SSD keeps the full expert weights in storage and brings the experts actually selected by the model into a limited slot bank. The runtime code covered here supports several related mechanisms:
+
+1. **Prefill bank:** larger batches use the shared expert bank and clear/reuse it layer by layer.
+2. **Decode cache window:** smaller decode batches may use per-layer windows, allowing experts to remain cached between successive decode steps.
+3. **Lookahead prefetch:** predictions for the next MoE layer can be read in the background while the current layer computes.
+4. **Deferred reads:** in decode-window mode, selected missing experts near the end of the fixed routing-rank order can be loaded in a second phase while earlier experts compute.
+5. **Diagnostics:** counters, trace files, and dummy-read modes help attribute latency to storage I/O, memory writes, scheduling, and cache behavior.
+
+Predictions guide loading and eviction; they do **not** replace the actual router's selected experts. A real miss still needs the selected expert's weights under normal operation. The dummy and skip modes below are special timing experiments and must not be used to evaluate answer quality or correctness.
+
+#### General parsing rules
+
+Environment values are read by the process at startup or when the relevant runtime object is initialized. Several values are cached in `static` locals on first use. **Set variables before launching the process** and restart it after changing them. Do not assume that changing a shell variable or calling `setenv()` in a running process will reconfigure an already-initialized runtime.
+
+##### Boolean-like values are usually not parsed as words
+
+Many switches use a simple C/C++ rule: the value is considered enabled when it exists, is non-empty, and its first character is not `0`. For those switches:
+
+- `VAR=1` enables it.
+- `VAR=0` disables it.
+- `VAR=true` also enables it because the first character is `t`.
+- **`VAR=false` also enables it** because the first character is `f`, not `0`.
+
+This rule applies to `LLAMA_MOE_LOOKAHEAD_PREFETCH`, `LLAMA_MOE_PARK_WINDOW`, `LLAMA_MOE_LOG_EVERY_STEP`, `LLAMA_MOE_DUMMY_READ`, and `LLAMA_MOE_SKIP_READ`. `LLAMA_MOE_PREFETCH_UNIFIED` is a special inverse-default switch: it is on unless a non-empty value starts with `0`. `LLAMA_MOE_F_NOCACHE` has its own string handling described below.
+
+Integer settings generally use `atoi()`. A malformed value may therefore be interpreted as zero rather than rejected with a clear parse error. Prefer plain decimal integers.
+
+#### Decode cache and window sizing
+
+##### `LLAMA_MOE_DECODE_WINDOW`
+
+**Purpose:** Activates the per-layer decode-cache window and supplies the model-side request for its width.
+
+- **Unset/empty:** The runtime resolver in the supplied source returns early and leaves the decode window disabled.
+- **Positive value:** Use the model-side window configuration; for example, `LLAMA_MOE_DECODE_WINDOW=16` is a typical form for requesting a 16-slot cache width.
+- **Model-side dependency:** The runtime obtains the actual width from `model.moe_decode_window()`. The same model-side configuration also determines tensor layout, so a runtime-only width that disagrees with the model's tensor allocation is not safe.
+- **Prerequisite:** The implementation requires shared-bank mode for per-layer windows. If that prerequisite is not met, the runtime logs that decode-cache mode is off.
+- **Capacity:** Each MoE layer has its own decode window. The runtime adds a prefetch staging region of size `K` when lookahead prefetch is enabled, so a layer's total window width is its cache region plus the prefetch region.
+
+**Important source nuance:** One log hint in the supplied implementation says “leave empty to use the bank maximum,” but the actual early-return code treats an unset or empty variable as disabled. Prefer the code path over that wording and verify behavior if using a different revision.
+
+Example:
 
 ```bash
-# Configure
-cmake -B build -DCMAKE_BUILD_TYPE=Release
-
-# Build
-cmake --build build --target llama-omni-server --target llama-omni-cli -j
+export LLAMA_MOE_DECODE_WINDOW=16
 ```
 
-> CMake will auto-detect and enable Metal (macOS) or CUDA (Linux with NVIDIA GPU).
+The number is not a universal recommendation. A larger window may reduce cache misses but increases memory demand.
 
-### Usage
+##### `LLAMA_MOE_LAYER_WINDOWS`
+
+**Purpose:** Requests a **non-uniform per-layer cache-width allocation**. The runtime asks the model for `model.moe_layer_windows()` and assigns each layer its corresponding cache width. This allows layers with higher reuse (“hot” layers) to receive more cache slots and colder layers fewer.
+
+- When the model-side setting is not active, the runtime uses a uniform width derived from `LLAMA_MOE_DECODE_WINDOW`.
+- Per-layer widths must match the tensor layout created during model loading. The runtime explicitly relies on the model side as the source of truth.
+- The runtime logs whether per-layer sizing appears active based on whether the environment variable exists.
+- **Exact syntax, separators, per-layer value semantics, validation, and fallback rules are not present in the supplied `llama-moe-slot.cpp` file.** Read the parser for `llama_model::moe_layer_windows()` in the exact commit before constructing a value; do not assume the value is a comma-separated list unless that parser confirms it.
+
+##### `LLAMA_MOE_WINDOW_MAX_ROWS`
+
+**Purpose:** Sets the requested maximum number of batch rows eligible to use the decode window. This is useful for small speculative-verification batches as well as single-token decode.
+
+- **Default:** `1` (single-row decode).
+- **Minimum:** The runtime forces the requested value to at least `1`. Zero, a negative number, or a non-numeric value therefore ends up as `1` under the current `atoi()`-based parsing.
+- **Capacity clamp:** The runtime examines the narrowest enabled layer window. It reduces the requested row count until the worst-case expert union fits in the available cache region. For a batch of `R` rows, with `top-k` experts selected per row, the upper-bound estimate is `min(R × top-k, total_experts)`.
+- **Unified vs. partitioned windows:** In partitioned mode, staging slots are unavailable to the main cache, which can lower the supported row count.
+- **Effect:** A configured maximum is only a request; a smaller value may be logged and used if the available window cannot hold the worst-case union.
+
+Example:
 
 ```bash
-# Basic usage (auto-detect all model paths from LLM path)
-./build/bin/llama-omni-cli \
-    -m /path/to/MiniCPM-o-4_5-gguf/MiniCPM-o-4_5-Q4_K_M.gguf
-
-# With custom reference audio (voice cloning)
-./build/bin/llama-omni-cli \
-    -m /path/to/MiniCPM-o-4_5-gguf/MiniCPM-o-4_5-Q4_K_M.gguf \
-    --ref-audio /path/to/your_voice.wav
-
-# Disable TTS (text-only output)
-./build/bin/llama-omni-cli \
-    -m /path/to/MiniCPM-o-4_5-gguf/MiniCPM-o-4_5-F16.gguf \
-    --no-tts
+# Request a maximum batch width of 4; runtime may clamp it down.
+export LLAMA_MOE_WINDOW_MAX_ROWS=4
 ```
 
-### CLI Options
+Do not increase this setting in isolation. Confirm that the model/runtime supports the batch shape and that every enabled layer has enough usable cache capacity.
 
-| Option | Description |
-|--------|-------------|
-| `-m <path>` | **Required**. Path to LLM GGUF model |
-| `--vision <path>` | Override vision model path |
-| `--audio <path>` | Override audio model path |
-| `--tts <path>` | Override TTS model path |
-| `--projector <path>` | Override projector model path |
-| `--ref-audio <path>` | Reference audio for voice cloning |
-| `-c, --ctx-size <n>` | Context size (default: 4096) |
-| `-ngl <n>` | Number of GPU layers (default: 99) |
-| `--no-tts` | Disable TTS output |
-| `--vision-batch-encode` | Encode same-size image slices in one batched pass (off by default; see below) |
-| `--test <prefix> <n>` | Run test with audio files |
-| `--bench-vision <img>` | Benchmark serial vs batched vision encoding on an image, then exit |
+#### Lookahead prefetch
 
-### Vision Batch Encoding (optional optimization)
+##### `LLAMA_MOE_LOOKAHEAD_PREFETCH`
 
-For high-resolution / high-refresh inputs, an image is split into one overview plus
-many equally-sized slices, and each slice is encoded by the ViT. By default these
-slices are encoded **one at a time** (serial). `--vision-batch-encode` instead packs
-all same-size slices into a **single batched** ViT pass, which is significantly faster
-when there are many slices.
+**Purpose:** Enables background lookahead prefetch during decode. The runtime predicts experts likely to be needed by the next MoE layer and schedules reads while the current layer computes.
 
-- **When to enable**: large images / high-res / high-refresh modes, i.e. cases that
-  produce many slices. On a 4821×2259 image this gives roughly **1.5–2.3× faster**
-  vision encoding (more slices → larger speedup).
-- **Why it's off by default**: batched cuBLAS GEMM uses a different accumulation order
-  than per-slice GEMM, so the embeddings are *numerically very close but not bit-exact*
-  (avg diff ~1e-2). It also uses somewhat more VRAM. It is therefore opt-in rather than
-  a universal default.
+- **Default:** Off.
+- **Enable:** Set a non-empty value whose first character is not `0`, conventionally `1`.
+- **Disable:** Leave unset, use an empty value, or set it to `0`.
+- **Initial depth:** `8`, unless overridden by `LLAMA_MOE_LOOKAHEAD_PREFETCH_DEPTH`.
+- **Resource guard:** The implementation supports a maximum depth of `16`. It also disables prefetch when the slot bank is too small: the requested depth must satisfy the internal capacity check `n_slots >= 2 × depth + 8`.
+- **Execution mode:** Without a decode window, prefetch uses a dedicated ping-pong tail of the slot bank. With a decode window, prefetch can be redirected into the target layer's window.
+
+Example:
 
 ```bash
-# Enable the optimization
-./build/bin/llama-omni-cli \
-    -m /path/to/MiniCPM-o-4_5-gguf/MiniCPM-o-4_5-Q4_K_M.gguf \
-    --omni --vision-batch-encode
-
-# Benchmark serial vs batched (prints a per-slice-count comparison table)
-./build/bin/llama-omni-cli \
-    -m /path/to/MiniCPM-o-4_5-gguf/MiniCPM-o-4_5-Q4_K_M.gguf \
-    --bench-vision /path/to/large_image.png
+export LLAMA_MOE_LOOKAHEAD_PREFETCH=1
 ```
 
-Programmatically the same switch is exposed via `common_params.vpm_batch_encode`
-(applied in `omni_init`) and `vision_set_batch_encode(ctx_vision, true)`.
+##### `LLAMA_MOE_LOOKAHEAD_PREFETCH_DEPTH`
 
-### Output
+**Purpose:** Controls the lookahead prefetch depth, i.e. how many predicted experts can be scheduled and how many staging slots are reserved for prefetch.
 
-Generated audio files are saved to `tools/omni/output/`:
+- **Read only when:** `LLAMA_MOE_LOOKAHEAD_PREFETCH` is enabled.
+- **Default when enabled:** `8`.
+- **Accepted integer range:** `0`–`16` inclusive.
+- **`0`:** Turns prefetch off, even if the parent switch is set.
+- **Out-of-range value:** The runtime ignores the override and keeps the default depth of `8`; it does not clamp an out-of-range value to the nearest endpoint.
+- **Small bank:** Even a valid depth can be disabled if the slot bank fails the capacity check above.
 
-```
-tools/omni/output/
-├── round_000/
-│   └── tts_wav/
-│       ├── wav_0.wav
-│       ├── wav_1.wav
-│       └── ...
-└── round_001/
-    └── tts_wav/
-        └── wav_1000.wav
-```
+Because prefetch depth reserves capacity and affects read volume, increase it gradually and measure the result rather than assuming that more lookahead is always faster.
 
----
+##### `LLAMA_MOE_PREFETCH_READ`
 
-## 🌐 Recommended Companion Demo — MiniCPM-o-Demo (Comni)
+**Purpose:** Controls how many of the predicted experts are actually read from storage. This separates **prediction** from **physical prefetch I/O**.
 
-For an out-of-the-box, end-to-end omni video-call experience built on top of `llama-omni-server`, we recommend the **Comni** branch of the official demo:
+- **Unset:** Follows the chosen prefetch depth (the historical behavior).
+- **`0`:** Prediction-only mode. The runtime skips disk reads by the prefetch worker, but the prediction signal can still inform cache eviction. This is not equivalent to disabling lookahead completely.
+- **`1` through `depth`:** Read at most that many distinct valid predicted experts, up to the configured depth.
+- **Negative value or value greater than `depth`:** Reset to `depth`.
+- **Malformed value:** Since the code uses `atoi()`, a non-numeric string can become `0` and select prediction-only behavior. Use a decimal integer.
+- **Dependency:** This setting has an effect only when lookahead prefetch is enabled.
 
-🔗 **[OpenBMB/MiniCPM-o-Demo @ Comni](https://github.com/OpenBMB/MiniCPM-o-Demo/tree/Comni)**
-
-It bundles a Python gateway + worker (which spawns and orchestrates `llama-omni-server`) and a desktop + mobile React frontend, supporting **macOS (Metal)**, **Linux (CUDA)**, and **Windows (CUDA)**. Use it when you want a turnkey video-call demo without writing your own HTTP integration.
-
-> 💡 **Don't want to compile?** Pre-built one-click installers (**Comni for Windows / macOS**) are available on the [llama.cpp-omni Releases page](https://github.com/tc-mb/llama.cpp-omni/releases).
-
-### TL;DR — Five Commands From Scratch
-
-If you already have the GGUF weights from [Prerequisites](#prerequisites):
+Examples:
 
 ```bash
-# 1. Build the C++ engine
-git clone https://github.com/tc-mb/llama.cpp-omni.git
-cd llama.cpp-omni && git checkout feat/web-demo \
-    && cmake -B build -DCMAKE_BUILD_TYPE=Release \
-    && cmake --build build --target llama-omni-server --target llama-omni-cli -j
-cd ..
+# Default: actually read up to the whole configured depth.
+unset LLAMA_MOE_PREFETCH_READ
 
-# 2. Set up the demo (Python venv + mobile frontend)
-git clone https://github.com/OpenBMB/MiniCPM-o-Demo.git
-cd MiniCPM-o-Demo && git checkout Comni
-bash install.sh
-( cd frontend/mobile && bun install && bun run --bun build:static )   # or `npm`
+# Predict and protect candidates during eviction, but do not pre-read their bytes.
+export LLAMA_MOE_PREFETCH_READ=0
 
-# 3. Configure (use absolute paths)
-cp config.example.json config.json
-# Edit config.json:
-#   "backend": "cpp"
-#   "cpp_backend.llamacpp_root" = absolute path to ../llama.cpp-omni
-#   "cpp_backend.model_dir"     = absolute path to MiniCPM-o-4_5-gguf
-
-# 4. Launch
-CUDA_VISIBLE_DEVICES=0 bash start_all.sh
-
-# 5. Open in browser
-#    https://localhost:8040/         (desktop)
-#    https://localhost:8040/mobile/  (mobile React)
+# With depth 8, read at most the first 4 distinct predictions.
+export LLAMA_MOE_PREFETCH_READ=4
 ```
 
-The detailed walkthrough below is the same content the demo repo's
-[`README.md`](https://github.com/OpenBMB/MiniCPM-o-Demo/blob/Comni/README.md) /
-[`README_zh.md`](https://github.com/OpenBMB/MiniCPM-o-Demo/blob/Comni/README_zh.md) covers — kept here so you don't have to bounce between repos.
+The source considers predictions in their provided order and filters out invalid IDs and duplicates before scheduling reads.
 
-### Architecture
+##### `LLAMA_MOE_PREFETCH_UNIFIED`
 
-```
-gateway.py        :8040 (HTTPS)        ─┐
-                                        │  HTTP / WS  (internal)
-worker.py         :22440 + i  GPU i    ─┘
-    │  spawns + HTTP-calls
-    ▼
-llama-omni-server      :19080 + i  GPU i
-    /v1/stream/omni_init
-    /v1/stream/update_session_config
-    /v1/stream/prefill
-    /v1/stream/decode    (SSE)
-    /v1/stream/break
-```
+**Purpose:** Chooses whether the decode-window cache and prefetch staging region share one LRU allocation.
 
-### Step-by-Step
+- **Default:** Unified mode on.
+- **Unified mode (default):** The main path and prefetch can use the same window. Useful experts may naturally remain in the cross-token cache rather than being isolated in a staging partition.
+- **Partitioned mode:** Set `LLAMA_MOE_PREFETCH_UNIFIED=0`. The main path is restricted to the cache region, while a separate staging region is reserved for prefetch.
+- **Scope:** Relevant when the decode window is enabled and prefetch staging slots exist. If lookahead is disabled, the prefetch staging size is zero, so the distinction has little or no practical effect.
+- **Tuning guidance:** The code comments characterize partitioned mode as an A/B-testing option; unified mode is the default. Benchmark both on the target model and storage if considering partitioning.
 
-**1. Build `llama-omni-server` from this repo**
+Example:
 
 ```bash
-git clone https://github.com/tc-mb/llama.cpp-omni.git
-cd llama.cpp-omni
-git checkout feat/web-demo
-cmake -B build -DCMAKE_BUILD_TYPE=Release
-cmake --build build --target llama-omni-server --target llama-omni-cli -j
+export LLAMA_MOE_PREFETCH_UNIFIED=1  # default behavior
+# or, for an A/B comparison:
+export LLAMA_MOE_PREFETCH_UNIFIED=0
 ```
 
-CMake auto-detects CUDA (Linux + NVIDIA) and Metal (macOS). After the build, `build/bin/llama-omni-server` is the binary `worker.py` will spawn — you do **not** need to start `llama-omni-server` yourself.
+##### Legacy names: `LLAMA_MOE_FATE` and `LLAMA_MOE_FATE_DEPTH`
 
-**2. Install Python dependencies**
+These are **not active configuration switches** in the supplied implementation. They are old names for the lookahead-prefetch mechanism. When the new prefetch variable is not enabled, the runtime may emit a warning that `LLAMA_MOE_FATE*` is no longer read.
+
+Use these instead:
+
+- `LLAMA_MOE_LOOKAHEAD_PREFETCH=1`
+- `LLAMA_MOE_LOOKAHEAD_PREFETCH_DEPTH=<0..16>`
+
+Do not rely on setting the legacy variables to enable the feature.
+
+#### I/O concurrency and scheduling
+
+##### `LLAMA_MOE_IO_THREADS`
+
+**Purpose:** Sets the number of parallel I/O threads used for reading experts in an I/O wave.
+
+- **Default:** `4`.
+- **Valid values:** `1`–`64` inclusive.
+- **Invalid values:** Zero, negative values, values over `64`, or a value parsed as zero cause the implementation to fall back to `4`.
+- **Performance considerations:** Expert reads are often storage-bandwidth-bound. More threads can help only if the device and file layout benefit from concurrent reads; excess concurrency may add scheduling overhead or increase I/O contention.
+- **Initialization:** The parsed value is cached on first use, so set it before launching the process.
+
+Example:
 
 ```bash
-git clone https://github.com/OpenBMB/MiniCPM-o-Demo.git
-cd MiniCPM-o-Demo
-git checkout Comni
-bash install.sh                   # creates .venv/base/ + installs deps
-# PYTHON=python3.11 bash install.sh   # to use a different interpreter
+export LLAMA_MOE_IO_THREADS=4
 ```
 
-`install.sh` creates `.venv/base/` (Python 3.10), upgrades `pip`, installs `torch==2.8.0` + `torchaudio==2.8.0`, and finally installs `requirements.txt`. The C++ backend doesn't use PyTorch at runtime, but the worker is still a Python process so the venv is needed.
+Try a controlled sweep such as `1`, `2`, `4`, and `8`, keeping the model, prompt, cache settings, and storage device constant. Do not assume the highest value is best.
 
-**3. Configure `config.json`**
+##### `LLAMA_MOE_MATMUL_SPLIT`
 
-Copy the template and set `backend` to `cpp`:
+**Purpose:** Enables a two-phase scheduling path (sometimes described in code comments as A2): some missing experts near the end of the fixed routing-rank order are deferred until earlier resident experts have begun computing. The goal is to overlap reads with GPU work while preserving summation order.
+
+- **Default:** `0` (disabled).
+- **Positive value:** Requests the number of trailing selected-expert positions per row whose missing reads may be deferred.
+- **Effective scope:** The source gates this on decode-window mode. The split must leave at least one earlier rank (`matmul_split < n_expert_used` for the current row) to form phase A; a value equal to or larger than the selected-expert count does not activate the split path under the current condition.
+- **Correctness intent:** The split uses fixed routing ranks rather than reordering by cache residency, to preserve summation order and output equivalence.
+- **Tuning:** This is a performance knob, not a general-purpose batch setting. Begin with small positive values and validate both speed and output equality on your build.
+
+Example:
 
 ```bash
-cp config.example.json config.json
+export LLAMA_MOE_MATMUL_SPLIT=2
 ```
 
-```json
-{
-    "backend": "cpp",
-    "cpp_backend": {
-        "llamacpp_root":   "/abs/path/to/llama.cpp-omni",
-        "model_dir":       "/abs/path/to/MiniCPM-o-4_5-gguf",
-        "llm_model":       "MiniCPM-o-4_5-Q4_K_M.gguf",
-        "cpp_server_port": 19080,
-        "ctx_size":        8192,
-        "n_gpu_layers":    99
-    },
-    "audio":   { "ref_audio_path": "assets/ref_audio/ref_minicpm_signature.wav",
-                 "playback_delay_ms": 200 },
-    "service": {
-        "gateway_port":     8040,
-        "worker_base_port": 22440,
-        "num_workers":      1,
-        "max_queue_size":   1000,
-        "request_timeout":  300.0,
-        "data_dir":         "data"
-    },
-    "duplex":  { "pause_timeout": 60.0 }
-}
-```
+It has no intended effect when the decode window is not active.
 
-| Field | Purpose |
-|-------|---------|
-| `cpp_backend.llamacpp_root` | Absolute path to your `llama.cpp-omni` checkout. `worker.py` runs `${llamacpp_root}/build/bin/llama-omni-server` and uses `${llamacpp_root}/tools/omni/output_<port>/` as the TTS WAV output dir |
-| `cpp_backend.model_dir` | Absolute path to the GGUF directory (LLM + `audio/` + `tts/` + `vision/` + `token2wav-gguf/`) |
-| `cpp_backend.llm_model` | LLM filename inside `model_dir`. Pick the quantization you downloaded (`Q4_K_M` / `Q8_0` / `F16`) |
-| `cpp_backend.cpp_server_port` | HTTP port `worker.py` will start `llama-omni-server` on. Worker `i` uses `cpp_server_port + i` |
-| `cpp_backend.ctx_size` / `n_gpu_layers` | Forwarded to `llama-omni-server` as `--ctx-size` / `--n-gpu-layers` |
+#### Page-cache policy
 
-**4. Build the mobile frontend (one-time)**
+##### `LLAMA_MOE_F_NOCACHE`
 
-The `/mobile/` route is served from `static/mobile/`, which is **gitignored** — it's the build output of the React + Vite project under `frontend/mobile/`:
+**Purpose:** Controls whether expert-file reads bypass the operating system's file/page cache. This can help investigate storage behavior or prevent large expert reads from displacing other useful cached data, but the best policy is workload- and platform-dependent.
+
+| Value | Behavior |
+|---|---|
+| Unset, empty, or `0` | Do not request page-cache bypass (default). |
+| `auto` | Phase-dependent. Request bypass for the large-batch/prefill path and use the normal page cache for decode/small-window batches. The phase is detected from row count relative to the supported window-batch width. |
+| Any other non-empty string | Request bypass continuously. For example, `1` enables it. A value such as `false` also falls into this case; use `0` to disable explicitly. |
+
+**Platform details from the source:**
+
+- On Linux, the code opens expert files with `O_DIRECT` when bypass is requested. Direct I/O has strict alignment requirements for file offsets, buffer addresses, and read lengths; an alignment-related `EINVAL` results in an explicit read error.
+- On Apple platforms, the code uses `fcntl(..., F_NOCACHE, ...)` to change the open file descriptors' cache behavior.
+- Platform support and behavior can differ; successful parsing of the variable does not guarantee that the operating system will honor the request.
+
+Examples:
 
 ```bash
-cd frontend/mobile
-bun install                    # or `npm install` (Node ≥ 20.19)
-bun run --bun build:static     # publishes to ../../static/mobile/
-cd ../..
+# Normal OS page cache (default)
+export LLAMA_MOE_F_NOCACHE=0
+
+# Switch cache policy by large-batch vs. decode phase
+export LLAMA_MOE_F_NOCACHE=auto
+
+# Always request page-cache bypass
+export LLAMA_MOE_F_NOCACHE=1
 ```
 
-See the demo repo's [`frontend/mobile/README.md`](https://github.com/OpenBMB/MiniCPM-o-Demo/blob/Comni/frontend/mobile/README.md) for dev proxy / npm-only / hot-reload details.
+Use `auto` as a comparison point rather than an unconditional recommendation. Page-cache bypass can make performance worse when repeated expert reads benefit from caching.
 
-**5. Start the stack**
+#### Memory parking
+
+##### `LLAMA_MOE_PARK_WINDOW`
+
+**Purpose:** Enables or disables the runtime's explicit expert-memory parking step at a round boundary. When enabled, the code drains outstanding lookahead work, invalidates the recorded prewarm placements, attempts to park eligible backend buffers, and clears the layer cache mappings. On the Metal path it looks up the backend's buffer park/unpark procedures dynamically.
+
+- **Default:** On when the variable is unset or empty.
+- **Disable:** Set `LLAMA_MOE_PARK_WINDOW=0`.
+- **Boolean parsing:** Any non-empty value not starting with `0` enables the setting (`false` therefore enables it).
+- **Backend qualification:** The actual buffer-parking operation depends on the backend exposing the relevant functions. The environment variable does not itself turn on Metal or change the model backend.
+
+Example:
 
 ```bash
-CUDA_VISIBLE_DEVICES=0 bash start_all.sh
+export LLAMA_MOE_PARK_WINDOW=1
 ```
 
-First boot loads all GGUF modules (VPM, APM, LLM, TTS, Token2Wav) and takes 10–60 s. The worker's `/health` returns `worker_status: "idle"` once `omni_init` finishes.
+Disable it only when comparing memory-lifecycle behavior or when investigating a backend-specific parking problem.
 
-Then open:
+#### Diagnostics and controlled experiments
 
-- `https://localhost:8040/`            — desktop entry (Home / Omni / Audio-Duplex / Turnbased / Half-Duplex)
-- `https://localhost:8040/mobile/`     — mobile React frontend
-- `https://localhost:8040/mobile-omni/` — mobile-adapted Omni page (DOM bridge over the desktop `omni-app.js`)
+##### `LLAMA_MOE_LOG_EVERY_STEP`
 
-> ⚠️ Camera / microphone require HTTPS. The self-signed certs under `certs/` work locally — accept the browser warning. Falling back to `bash start_all.sh --http` will only allow text input (browsers block `MediaDevices` on insecure origins).
+**Purpose:** Increases the frequency of MoE step-level I/O and scheduling logs.
 
-### Stop
+- **Default:** Off; the runtime uses sparse logging after the first steps.
+- **Enable:** `LLAMA_MOE_LOG_EVERY_STEP=1`.
+- **Effect:** Forces the per-step logging predicate to return true, making counters easier to attribute to individual decode/prefill steps. It does not alter expert routing, cache capacity, or normal read semantics.
+- **Performance:** More logging can add overhead and produce large logs; avoid it for final throughput measurements unless the logging overhead is part of the experiment.
+
+Example:
 
 ```bash
-pkill -f "gateway.py|worker.py|llama-omni-server"
+export LLAMA_MOE_LOG_EVERY_STEP=1
 ```
 
-`worker.py` automatically restarts `llama-omni-server` after each session (`full_reinit`) to keep KV cache state clean across runs.
+##### `LLAMA_MOE_SWEEP`
 
-### Multi-GPU
+**Purpose:** Writes raw routing/prediction traces to a file for later hit-rate and prefetch-coverage analysis.
 
-Set `service.num_workers > 1` in `config.json` and pass the visible devices:
+- **Value:** A filesystem path.
+- **Unset/empty:** Disabled.
+- **File handling:** The source opens the path in write mode (`"w"`), so an existing file at that path is overwritten. Ensure the parent directory exists and is writable.
+- **Decode record:** One record per layer and decode step, approximately `L<layer> E:<actual expert IDs> P:<predicted expert IDs>`.
+  - `E:` contains experts actually used by that layer.
+  - `P:` contains experts predicted for that target layer from the previous layer; the prediction list is recorded in descending score order.
+- **Prefill record:** `P<layer> E:<expert IDs>` records experts used by the final token during prefill, for experiments on seeding the subsequent decode cache.
+- **Scope:** Diagnostic output only; it does not itself tune the cache or change routing.
+
+Example:
 
 ```bash
-CUDA_VISIBLE_DEVICES=0,1 bash start_all.sh
+export LLAMA_MOE_SWEEP=/tmp/moe-routing-sweep.txt
 ```
 
-Each worker is bound to its own GPU (via `CUDA_VISIBLE_DEVICES`) and spawns its own `llama-omni-server` on `cpp_server_port + worker_index`.
+Keep the trace together with the model revision, prompts, and runtime configuration. Routing traces are useful for comparing cache sizes and prefetch depths offline, but results depend on the exact model and token sequence.
 
-### Troubleshooting
+##### `LLAMA_MOE_PREWARM`
 
-| Symptom | Likely cause |
-|---------|--------------|
-| Worker log: `llama-omni-server not found` | `cpp_backend.llamacpp_root` is wrong, or `cmake --build … --target llama-omni-server` was not run |
-| Worker `/health` stays at `worker_status: "loading"` for a long time | `omni_init` is still loading GGUF modules. Check `tmp/worker_<i>.log` for lines tagged `[CPP]` |
-| WAV files appear under `${llamacpp_root}/tools/omni/output_<port>/round_XXX/` but the browser plays nothing | The gateway is HTTP — many browsers block `Audio` / `MediaDevices` on insecure origins. Use the default HTTPS mode |
-| `kv_cache_length` keeps shrinking mid-conversation | C++ side sliding-window pruning is kicking in. The desktop and mobile UIs expose a "Stop on KV pruning" toggle (default on) that ends the session cleanly when this happens |
+**Purpose:** Supplies a static table of expert IDs to pre-load into the per-layer decode cache before normal generation.
 
-For more details and Chinese documentation, see the demo repo: [`README.md`](https://github.com/OpenBMB/MiniCPM-o-Demo/blob/Comni/README.md) / [`README_zh.md`](https://github.com/OpenBMB/MiniCPM-o-Demo/blob/Comni/README_zh.md).
+- **Value:** Path to a text file. Unset/empty disables table loading.
+- **Requires:** A working decode window (`LLAMA_MOE_DECODE_WINDOW`) and at least one valid expert ID in the table. The runtime marks prewarming as enabled only when the table contains at least one accepted ID and decode-window capacity is positive.
+- **Important lifecycle detail:** Setting this variable only loads the table. The application must call the public prewarm entry point (`llama_moe_prewarm_experts`) while the runtime is idle and before prefill; no decode operation may be in flight. After use, prewarm state is one-shot and must be prepared again for a later generation round.
+- **Format:** One data line per model layer, in model layer order. Expert IDs on each line are separated by commas and/or whitespace. Lines beginning with `#` and blank lines are ignored and do not count as layers. `#` starts an inline comment after the IDs as well.
+- **IDs:** Only integers satisfying `0 <= expert_id < n_expert` are accepted; invalid/out-of-range values are ignored by the parser.
+- **Line-to-layer mapping:** The first nonblank, noncomment line applies to layer 0; the second applies to layer 1, and so on. The mapping is based on data lines, not physical file line numbers.
 
+Example prewarm file (`moe-prewarm.txt`):
 
+```text
+# One row per layer; expert IDs are model-specific.
+3, 7, 12, 19
+0 4 11 23   # layer 1
 
+# A blank or comment line does not advance the layer number.
+5, 9, 14    # layer 2
+```
 
-
-## HTTP API & Integration Guide
-> 📝 This section is based on community integration experience.
-
-This section documents the HTTP API call sequence for integrating llama-omni-server into your own application (e.g. a Tauri/Electron desktop app). The official CLI is a black box — if you want programmatic control, you need to call these endpoints directly.
-
-> This guide is based on real-world integration experience. Several critical details are **not documented elsewhere**.
-
----
-
-### 1. Start llama-omni-server
+Enable the table with:
 
 ```bash
-./llama-omni-server \
-  --host 0.0.0.0 \
-  --port 9060 \
-  --model /path/to/MiniCPM-o-4_5-Q4_K_M.gguf \
-  -ngl 99 \
-  --ctx-size 8192 \
-  --repeat-penalty 1.05 \
-  --temp 0.7
+export LLAMA_MOE_PREWARM=/absolute/path/to/moe-prewarm.txt
 ```
 
-Poll `GET /health` until it returns 200 before proceeding. It typically takes 10–60 seconds.
+The example IDs are illustrative only; use valid expert IDs for the exact model. Prewarming is most useful when the table was generated or measured for a representative prompt/workload.
+
+##### `LLAMA_MOE_DUMMY_READ`
+
+**Purpose:** Isolates the cost of storage reads from the cost of writing into the actual expert slot tensors.
+
+- **Enable:** A non-empty value whose first character is not `0`, conventionally `1`.
+- **Behavior:** Reads the same expert bytes from storage into a persistent scratch buffer instead of writing them into the slot tensors. This still performs real I/O but does not populate the selected experts' weights as normal inference expects.
+- **Correctness:** The resulting model output is invalid. Use only for timing experiments; do not use the generated text as a result.
+- **Precedence:** If both `LLAMA_MOE_DUMMY_READ` and `LLAMA_MOE_SKIP_READ` are enabled, **dummy-read mode wins** because it is checked first.
+
+Example:
 
 ```bash
-# Wait for ready
-curl http://localhost:9060/health
+export LLAMA_MOE_DUMMY_READ=1
 ```
 
----
+##### `LLAMA_MOE_SKIP_READ`
 
-### 2. Initialize — `POST /v1/stream/omni_init`
+**Purpose:** Measures an approximate path with physical expert reads removed.
 
-Call this **once per application lifecycle**. It loads all model modules, sets up voice cloning, and internally executes the `index=0` prefill (system prompt initialization).
+- **Enable:** A non-empty value whose first character is not `0`, conventionally `1`.
+- **Behavior:** The read routine increments its miss accounting and returns without issuing the expert-file read.
+- **Correctness:** Expert weights are not loaded as required, so outputs are invalid. Use only for a diagnostic timing baseline.
+- **Precedence:** `LLAMA_MOE_DUMMY_READ=1` overrides this setting if both are on.
+- **Interaction with delay:** The skip path returns before the artificial delay is applied, so `LLAMA_MOE_READ_DELAY_US` does not add a delay to skipped reads.
 
-```json
-POST /v1/stream/omni_init
+Example:
 
-{
-  "media_type": 2,
-  "use_tts": true,
-  "duplex_mode": true,
-  "model_dir": "/path/to/MiniCPM-o-4_5-gguf",
-  "tts_bin_dir": "/path/to/MiniCPM-o-4_5-gguf/tts",
-  "tts_gpu_layers": 100,
-  "token2wav_device": "gpu:0",
-  "output_dir": "/path/to/output",
-  "voice_audio": "/path/to/reference_voice.wav"
-}
+```bash
+export LLAMA_MOE_SKIP_READ=1
 ```
 
-| Field | Description |
-|-------|-------------|
-| `media_type` | `2` = vision + audio (full omni) |
-| `duplex_mode` | `true` enables full-duplex streaming |
-| `voice_audio` | Reference WAV for voice cloning. Omit to use default voice |
-| `output_dir` | Directory where TTS WAV files will be written |
+Use dummy-read and skip-read in **separate runs** to compare the cost of real reads against the no-read baseline. The source comments describe these as structural/I/O isolation modes, not valid inference configurations.
 
-**Expected response:**
-```json
-{ "success": true, ... }
+##### `LLAMA_MOE_READ_DELAY_US`
+
+**Purpose:** Adds a fixed artificial delay before a physical expert read, for estimating how much read latency is exposed on the critical path.
+
+- **Default:** `0` microseconds.
+- **Effect:** A positive integer `D` sleeps for approximately `D` microseconds before each real read. The added sleep is per read invocation, not per whole token or generation.
+- **No effect:** Zero or negative values do not add a delay.
+- **Interactions:** It does not delay reads skipped by `LLAMA_MOE_SKIP_READ`. Dummy-read mode still performs physical I/O, so the delay applies there.
+- **Initialization:** Parsed once and cached for use by the read routine. Set it before launching the process.
+
+Example:
+
+```bash
+export LLAMA_MOE_READ_DELAY_US=1000  # request 1 ms of delay per physical read
 ```
 
-> ⚠️ `omni_init` internally completes `index=0` prefill. **Do not** send a separate `cnt=0` prefill after this call. Start your prefill counter at `1`.
+Use only for controlled experiments. This is not a storage tuning parameter and should normally be unset for production inference.
 
----
+#### Cache prewarming file format
 
-### 3. Prefill Loop — `POST /v1/stream/prefill`
+The following example is intended to make the table syntax explicit:
 
-After `omni_init`, enter a continuous loop. Each iteration sends 1 second of audio + 1 screenshot frame. The counter `cnt` increments by 1 each call and **never resets** within a session.
-
-```json
-POST /v1/stream/prefill
-
-{
-  "audio_path_prefix": "/path/to/audio_chunk.wav",
-  "img_path_prefix": "/path/to/screenshot.png",
-  "cnt": 1
-}
+```text
+# layer 0
+1, 8, 11, 17
+# layer 1 (comments do not count as a layer)
+2 6 10 15
+4,9,13     # layer 2
 ```
 
-| Field | Description |
-|-------|-------------|
-| `cnt` | Starts at `1`, increments every call. `0` is reserved for `omni_init` |
-| `audio_path_prefix` | 1-second audio chunk (16kHz WAV). Send a silence chunk if mic is muted |
-| `img_path_prefix` | Current screen frame. Can reuse last frame if no update |
+The table's IDs are examples, not recommendations. Obtain IDs from a compatible routing trace or another workload-specific source. Verify that the table was produced for the same model, expert indexing, and layer order. A stale or mismatched prewarm table may waste cache space and produce no performance benefit, even though invalid IDs are filtered.
 
-> ⚠️ **Always send an audio chunk**, even when muted. Submitting a silence segment keeps the duplex loop rhythm intact. Skipping will cause timing drift.
+#### Configuration examples
 
-**Recommended loop cadence:** 1000ms per iteration.
+These are starting points for experiments, not guaranteed optimal values. Tune one dimension at a time and capture the runtime logs.
 
----
+##### 1. Basic decode-window plus lookahead starting point
 
-### 4. Decode — `POST /v1/stream/decode`
+```bash
+export LLAMA_MOE_DECODE_WINDOW=16
+export LLAMA_MOE_LOOKAHEAD_PREFETCH=1
+export LLAMA_MOE_LOOKAHEAD_PREFETCH_DEPTH=8
+export LLAMA_MOE_PREFETCH_UNIFIED=1
+export LLAMA_MOE_IO_THREADS=4
+# Optional: allow only single-row decode to use the window.
+export LLAMA_MOE_WINDOW_MAX_ROWS=1
 
-Call decode **after each prefill**. It triggers the LLM to generate a response and returns an SSE stream.
-
-```json
-POST /v1/stream/decode
-
-{
-  "debug_dir": "/path/to/output",
-  "stream": true
-}
+# Then launch the build that supports the MoE-SSD code and its slot-bank option.
+# Example command shape; supply your own model path and prompt/options:
+./build/bin/llama-cli -m /path/to/model.gguf --moe-slot-bank 640 -p "Hello"
 ```
 
-**SSE stream response format:**
+The model-side code must support the selected window value and allocate compatible tensors. `--moe-slot-bank` is a separate command-line option, not an environment variable.
 
-```
-data: {"content": "Hello", "is_listen": false, "stop": false}
-data: {"content": "!", "is_listen": false, "stop": false}
-data: {"is_listen": true, "stop": false}
-data: [DONE]
-```
+##### 2. Compare prefetch strategies
 
-| Field | Description |
-|-------|-------------|
-| `content` | Text token chunk. Empty string is possible, filter before display |
-| `is_listen` | `true` = model has switched to listening state (stop playing audio) |
-| `stop` | `true` = generation fully complete |
+Run each configuration in a fresh process with the same model, prompt, batch sizes, and storage device:
 
-> ⚠️ The text field is **`content`**, not `text`. This is inconsistent with standard OpenAI-compatible SSE format.
+```bash
+# A: standard lookahead reads (default count equals depth)
+LLAMA_MOE_LOOKAHEAD_PREFETCH=1 \
+LLAMA_MOE_LOOKAHEAD_PREFETCH_DEPTH=8 \
+./build/bin/llama-cli ...
 
----
+# B: prediction only (no prefetch-worker disk reads)
+LLAMA_MOE_LOOKAHEAD_PREFETCH=1 \
+LLAMA_MOE_LOOKAHEAD_PREFETCH_DEPTH=8 \
+LLAMA_MOE_PREFETCH_READ=0 \
+./build/bin/llama-cli ...
 
-### 5. Audio Output
-
-TTS WAV files are written incrementally to `output_dir/round_XXX/tts_wav/`. Watch this directory for new files and play them in order.
-
-Use a filesystem watcher (e.g. `notify` in Rust) to detect new WAV files as they appear during decode.
-
-```
-output_dir/
-├── round_000/
-│   └── tts_wav/
-│       ├── wav_0.wav
-│       ├── wav_1.wav
-│       └── ...
-└── round_001/
-    └── tts_wav/
-        └── wav_1000.wav
+# C: fewer physical prefetch reads
+LLAMA_MOE_LOOKAHEAD_PREFETCH=1 \
+LLAMA_MOE_LOOKAHEAD_PREFETCH_DEPTH=8 \
+LLAMA_MOE_PREFETCH_READ=4 \
+./build/bin/llama-cli ...
 ```
 
-> ⚠️ Mute your microphone input while playing back TTS audio to prevent echo feedback into the prefill loop.
+Compare elapsed time and the runtime's per-step counters, not only the number of predictions. A large number of predictions does not guarantee they finish before the layer needs them.
 
----
+##### 3. Record a routing/prediction trace
 
-### Full Call Sequence Summary
-
-```
-start llama-omni-server
-    ↓
-GET /health  (poll until 200)
-    ↓
-POST /v1/stream/omni_init  (cnt=0 handled internally, start your counter at 1)
-    ↓
-loop every ~1000ms:
-    POST /v1/stream/prefill  { cnt: N, audio, image }
-    POST /v1/stream/decode   → consume SSE → play WAV files from output_dir
-    N++
+```bash
+LLAMA_MOE_SWEEP=/tmp/moe-sweep.txt \
+LLAMA_MOE_LOG_EVERY_STEP=1 \
+./build/bin/llama-cli ...
 ```
 
----
+Check that the trace file was created, then use the analysis tools available in your checkout to examine expert reuse or sweep candidate depths and cache capacities. The log-heavy run is intended for analysis, not final benchmark numbers.
 
-## Contributing
+##### 4. Measure I/O versus slot-write overhead
 
-We welcome contributions. Start with the **[contributing guide](docs/contributing/README.md)**,
-which links to the community task list grouped by difficulty, plus good first issues
-and open research areas.
+Run these modes independently and do not evaluate the generated output:
 
-If you want to pick something up, comment on the linked issue before writing code.
-For anything beyond a trivial fix we would rather agree on the approach first than
-review a large pull request that goes the wrong way.
+```bash
+# Normal read and write path (baseline)
+./build/bin/llama-cli ...
+
+# Real reads to scratch memory; slot tensors are not populated normally
+LLAMA_MOE_DUMMY_READ=1 ./build/bin/llama-cli ...
+
+# No physical read
+LLAMA_MOE_SKIP_READ=1 ./build/bin/llama-cli ...
+```
+
+Keep all other settings identical. The differences help estimate which portion of time comes from real storage I/O and which portion comes from the CPU/graph/scheduling structure. Dummy/skip modes deliberately break normal expert loading.
+
+##### 5. Test page-cache behavior
+
+```bash
+# Default: page cache enabled
+LLAMA_MOE_F_NOCACHE=0 ./build/bin/llama-cli ...
+
+# Bypass for every expert read
+LLAMA_MOE_F_NOCACHE=1 ./build/bin/llama-cli ...
+
+# Bypass on the large-batch/prefill path, keep cache for decode
+LLAMA_MOE_F_NOCACHE=auto ./build/bin/llama-cli ...
+```
+
+On Linux, check for direct-I/O alignment errors. Compare cold and warm runs separately; otherwise page-cache state can make results misleading.
+
+#### Troubleshooting
+
+| Symptom | Things to check |
+|---|---|
+| Lookahead logs show `off` | Set `LLAMA_MOE_LOOKAHEAD_PREFETCH=1`. The depth variable alone does not enable the feature. Check that depth is `1`–`16` and that the slot bank meets the capacity guard (`n_slots >= 2 × depth + 8`). |
+| Prefetch is off despite a valid depth | The slot bank may be too small and the runtime may have set effective depth to zero. Reduce depth or increase the slot bank. |
+| Decode-cache window logs show `off` | Ensure `LLAMA_MOE_DECODE_WINDOW` is non-empty and the model-side resolver returns a positive width. The runtime also requires shared-bank mode and matching model-side tensor layout. |
+| Window supports only one row | Check `LLAMA_MOE_WINDOW_MAX_ROWS`, `LLAMA_MOE_PREFETCH_UNIFIED`, the selected experts per row, and the narrowest layer's usable cache capacity. Runtime clamping is expected when capacity is insufficient. |
+| Per-layer window sizing appears inactive | Verify that the exact model-side parser supports `LLAMA_MOE_LAYER_WINDOWS` and that the value format matches this revision. The supplied runtime file does not define that format. |
+| `LLAMA_MOE_PREFETCH_READ=0` seems to turn off physical prefetch | That is expected: predictions may still inform eviction, but the prefetch worker does not perform the predicted-expert reads. |
+| Generated output is wrong in a benchmark | Check that `LLAMA_MOE_DUMMY_READ` and `LLAMA_MOE_SKIP_READ` are unset or `0`; both are diagnostic modes that break normal expert loading. |
+| A `false` value unexpectedly enables a feature | Most boolean-like switches only check whether the first character is `0`. Use `0` to disable; use `1` to enable. |
+| Linux errors mention bad alignment for `LLAMA_MOE_F_NOCACHE` | `O_DIRECT` requires aligned offsets, lengths, and memory. Disable the setting to verify the baseline, then check the model's packed expert layout and the exact build. |
+| Prewarm logs report disabled/no effect | Check that the file opens, includes valid expert IDs, the decode window is active, and the application actually calls `llama_moe_prewarm_experts()` at the correct point in the lifecycle. |
+| Sweep file is missing or empty | Confirm the path is writable and its parent directory exists. Check for the runtime's `sweep: cannot open` log message. Also verify the workload reaches decode/prefill execution. |
+| Throughput is worse with more I/O threads or deeper prefetch | Storage bandwidth, I/O concurrency, exposed critical-path reads, prediction quality, cache eviction, and logging overhead all matter. Sweep one variable at a time. |
+
+#### Related non-environment setting
+
+`--moe-slot-bank <N>` is a command-line option rather than an environment variable, but it strongly affects these settings. The slot-bank size constrains ordinary expert residency and lookahead's dedicated ping-pong reservation. The supplied code disables lookahead when the bank is too small for the configured depth. A bank that is too small can also cause expert-capacity failures during a batch; increasing it consumes more memory.
+
+Changing `LLAMA_MOE_LOOKAHEAD_PREFETCH_DEPTH` without considering the bank size is therefore not a complete tuning strategy. Likewise, a larger `LLAMA_MOE_DECODE_WINDOW` only helps if the model-side tensor layout and available memory support it.
+
+#### Sources and scope
+
+- **Primary source for behavior:** the `llama-moe-slot.cpp` implementation snapshot supplied for this task (translated copy: `llama-moe-slot.en.cpp`). The runtime details and parsing notes in this document are based on that file.
+- **Project:** [OpenBMB/llama.cpp-omni](https://github.com/OpenBMB/llama.cpp-omni).
+- **Conceptual background:** [LES: Lookahead Expert Scheduling](https://github.com/OpenBMB/llama.cpp-omni/blob/main/docs/les/lookahead-expert-scheduling.md), which explains why expert prefetch is overlapped with compute and that routing predictions are used for scheduling rather than replacing the model's actual routing.
+
+This is a practical reference for the variables identified in the supplied MoE-SSD runtime source, not a guarantee that every build in the repository recognizes the same set. Always prefer the parser and runtime code from the exact commit used to build the executable.
